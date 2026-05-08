@@ -62,7 +62,7 @@ class VentanaPrincipal(QMainWindow):
         grid_controles.addWidget(self.slider_blur, 1, 0)
 
         self.slider_tol = QSlider(Qt.Orientation.Horizontal)
-        self.slider_tol.setRange(0, 255)
+        self.slider_tol.setRange(1, 100) # Cuantizado del 1 al 100
         self.slider_tol.setValue(self.config.tolerancia)
         self.slider_tol.valueChanged.connect(self.al_cambiar_tolerancia)
         grid_controles.addWidget(self.slider_tol, 1, 1)

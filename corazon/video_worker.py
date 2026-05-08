@@ -12,10 +12,16 @@ from .core.config import TrackerConfig
 from .core.kit_procesamiento import SelectorKits
 
 class VideoWorker(QObject):
-    # Emitimos 3 imágenes: Original, Máscara 1 (Rastreo), Máscara 2 (Medición)
+    """
+    Trabajador principal encargado de:
+    1. Geometría Hexagonal anclada a la pantalla (+20% largo, ancho 50%).
+    2. Detección de Extremos en la franja central (1%).
+    3. Tolerancia Dinámica (Mediana = 50).
+    4. Tanteo IoU Altamente Optimizado (ROI).
+    """
+    
     frame_ready = pyqtSignal(QImage, QImage, QImage, QImage) 
     stats_ready = pyqtSignal(dict)
-    exposicion_lista = pyqtSignal(np.ndarray)
     finished = pyqtSignal()
 
     def __init__(self, video_path, config: TrackerConfig):
@@ -24,11 +30,20 @@ class VideoWorker(QObject):
         self.config = config
         self._running = True
     
-        # SISTEMA DE FRICCIÓN
+        # Sistema de Fricción (Jerarquía de Ejes)
         self.historial_cx = deque(maxlen=10)
         self.historial_cy = deque(maxlen=10)
         self.historial_rojo_x = deque(maxlen=30)
         self.historial_rojo_y = deque(maxlen=30)
+
+        self.hex_solido_maestro = None
+        self.roi_hex_coords = None
+        self.extremos_corazon = [] 
+        self._last_blur_val = -1
+        self._hex_suave_cache = None
+
+    def stop(self):
+        self._running = False
 
     @pyqtSlot()
     def run(self):
@@ -37,130 +52,213 @@ class VideoWorker(QObject):
             self.finished.emit()
             return
 
-        # --- FASE 1: MÁQUINA DEL TIEMPO ---
-        datos_eje = viaje_en_el_tiempo_definitivo(cap)
-        ang_cyan, img_exposicion, fix_x, fix_y, eje_mayor, eje_menor_base = datos_eje
+        # =================================================================
+        # FASE 0: GEOMETRÍA ANCLADA A LOS BORDES DE LA PANTALLA
+        # =================================================================
+        res = viaje_en_el_tiempo_definitivo(cap)
+        angulo_cyan, mascara_tiempo, fijo_x, fijo_y, _, _ = res
+
+        if mascara_tiempo is None:
+            self.finished.emit()
+            return
+
+        h_f, w_f = mascara_tiempo.shape
+        rad_cyan = math.radians(angulo_cyan)
         
-        if img_exposicion is not None:
-            self.exposicion_lista.emit(img_exposicion)
+        v_long_x, v_long_y = math.sin(rad_cyan), -math.cos(rad_cyan)
+        v_trans_x, v_trans_y = math.cos(rad_cyan), math.sin(rad_cyan)
         
-        rad_cyan = math.radians(ang_cyan)
+        # 1. Trazar el eje y ver dónde choca exactamente con los bordes de la cámara
+        pt1 = (int(fijo_x + 5000 * v_long_x), int(fijo_y + 5000 * v_long_y))
+        pt2 = (int(fijo_x - 5000 * v_long_x), int(fijo_y - 5000 * v_long_y))
+        
+        rect_img = (0, 0, w_f, h_f)
+        ret_clip, p_a, p_b = cv2.clipLine(rect_img, pt1, pt2)
+        
+        if ret_clip:
+            # El centro del segmento es el centro de nuestro hexágono
+            centro_vis_x = (p_a[0] + p_b[0]) / 2.0
+            centro_vis_y = (p_a[1] + p_b[1]) / 2.0
+            
+            # El largo visible es la distancia de borde a borde
+            largo_pantalla = math.hypot(p_a[0] - p_b[0], p_a[1] - p_b[1])
+            
+            # --- GEOMETRÍA: +20% de largo, 50% de ancho ---
+            L_h = largo_pantalla * 1.20 
+            W_h = L_h * 0.50
+            
+            pts_hex = np.array([
+                [centro_vis_x + v_long_x * (L_h/2), centro_vis_y + v_long_y * (L_h/2)],
+                [centro_vis_x + v_long_x * (L_h/4) + v_trans_x * (W_h/2), centro_vis_y + v_long_y * (L_h/4) + v_trans_y * (W_h/2)],
+                [centro_vis_x - v_long_x * (L_h/4) + v_trans_x * (W_h/2), centro_vis_y - v_long_y * (L_h/4) + v_trans_y * (W_h/2)],
+                [centro_vis_x - v_long_x * (L_h/2), centro_vis_y - v_long_y * (L_h/2)],
+                [centro_vis_x - v_long_x * (L_h/4) - v_trans_x * (W_h/2), centro_vis_y - v_long_y * (L_h/4) - v_trans_y * (W_h/2)],
+                [centro_vis_x + v_long_x * (L_h/4) - v_trans_x * (W_h/2), centro_vis_y + v_long_y * (L_h/4) - v_trans_y * (W_h/2)]
+            ], dtype=np.int32)
+            
+            self.hex_solido_maestro = np.zeros((h_f, w_f), dtype=np.uint8)
+            cv2.fillPoly(self.hex_solido_maestro, [pts_hex], 255)
+
+            # Precalculamos el Bounding Box del Hexágono para cálculos matemáticos veloces después
+            y_idx, x_idx = np.where(self.hex_solido_maestro > 0)
+            if len(y_idx) > 0:
+                self.roi_hex_coords = (np.min(y_idx), np.max(y_idx)+1, np.min(x_idx), np.max(x_idx)+1)
+            else:
+                self.roi_hex_coords = (0, h_f, 0, w_f)
+
+            # --- DETECCIÓN DE EXTREMOS (FRANJA DEL 1%) ---
+            grosor_1_porciento = max(1, int(L_h * 0.01))
+            franja_mask = np.zeros((h_f, w_f), dtype=np.uint8)
+            cv2.line(franja_mask, p_a, p_b, 255, grosor_1_porciento)
+            
+            # Intersección entre la Exposición (el corazón real) y el eje del 1%
+            inter_eje_corazon = cv2.bitwise_and(mascara_tiempo, franja_mask)
+            cnts_eje, _ = cv2.findContours(inter_eje_corazon, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            # Limpiamos basura de 1 píxel
+            cnts_validos = [c for c in cnts_eje if cv2.contourArea(c) > 1.0]
+            
+            if len(cnts_validos) >= 2:
+                centroides = []
+                for c in cnts_validos:
+                    M_c = cv2.moments(c)
+                    if M_c["m00"] != 0:
+                        centroides.append((int(M_c["m10"]/M_c["m00"]), int(M_c["m01"]/M_c["m00"])))
+                    else:
+                        centroides.append((c[0][0][0], c[0][0][1]))
+                
+                # Buscamos la distancia máxima entre 2 grupos para hallar las "puntas"
+                max_d = -1
+                mejor_par = []
+                for i in range(len(centroides)):
+                    for j in range(i+1, len(centroides)):
+                        d = math.hypot(centroides[i][0]-centroides[j][0], centroides[i][1]-centroides[j][1])
+                        if d > max_d:
+                            max_d = d
+                            mejor_par = [centroides[i], centroides[j]]
+                
+                self.extremos_corazon = mejor_par
+
+        else:
+            self.hex_solido_maestro = np.zeros((h_f, w_f), dtype=np.uint8)
+            self.roi_hex_coords = (0, h_f, 0, w_f)
+
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         procesador = SelectorKits.obtener_kit(self.config.kit_procesamiento)
+        lx, ly = 3000 * v_long_x, 3000 * v_long_y
 
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        intervalo = 1 / (fps if fps > 0 else 30)
-
-        # --- FASE 2: BUCLE DE TRACKING ---
+        # =================================================================
+        # BUCLE DE TRACKING EN TIEMPO REAL
+        # =================================================================
         while self._running:
             start_time = time.time()
             ret, frame = cap.read()
-            
-            if not ret:
+            if not ret: 
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 continue
 
-            # 1. GROSORES RELATIVOS
-            h_f, w_f = frame.shape[:2]
-            t_fino = max(1, int(w_f * 0.002))
-            t_medio = max(2, int(w_f * 0.004))
-            t_grueso = max(3, int(w_f * 0.006))
+            # --- CACHÉ DE DESENFOQUE (Alto rendimiento visual) ---
+            if self._last_blur_val != self.config.desenfoque:
+                # El slider ahora rige el % sobre el largo del hexágono total
+                blur_ratio = max(1, int(self.config.desenfoque)) / 100.0
+                k_size = int(L_h * blur_ratio)
+                if k_size % 2 == 0: k_size += 1
+                k_size = max(3, k_size)
+                
+                self._hex_suave_cache = cv2.GaussianBlur(self.hex_solido_maestro, (k_size, k_size), 0)
+                self._last_blur_val = self.config.desenfoque
 
-            # ========================================================
-            # 2. PLANOS GEOMÉTRICOS (El Worker solo dibuja dónde buscar)
-            # ========================================================
-            v_long_x, v_long_y = math.sin(rad_cyan), -math.cos(rad_cyan)
-            v_trans_x, v_trans_y = math.cos(rad_cyan), math.sin(rad_cyan)
+            hex_suave = self._hex_suave_cache
 
-            L = eje_mayor
-            
-            # --- MODIFICACIÓN AQUÍ ---
-            # Antes: W = min(eje_menor_base, L / 2.0)
-            # Ahora: Hacemos el ancho base un 50% más grande, 
-            # y subimos el límite para que pueda ser hasta el 80% del largo.
-            W = 2.8*min(eje_menor_base * 1.3, L * 0.8)
-
-            # Polígono Sólido (Límite exterior)
-            hex_pts = np.array([
-                [fix_x + L * v_long_x, fix_y + L * v_long_y],
-                [fix_x + (L/2) * v_long_x + W * v_trans_x, fix_y + (L/2) * v_long_y + W * v_trans_y],
-                [fix_x - (L/2) * v_long_x + W * v_trans_x, fix_y - (L/2) * v_long_y + W * v_trans_y],
-                [fix_x - L * v_long_x, fix_y - L * v_long_y],
-                [fix_x - (L/2) * v_long_x - W * v_trans_x, fix_y - (L/2) * v_long_y - W * v_trans_y],
-                [fix_x + (L/2) * v_long_x - W * v_trans_x, fix_y + (L/2) * v_long_y - W * v_trans_y]
-            ], np.int32)
-            hexagon_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
-            cv2.fillPoly(hexagon_mask, [hex_pts], 255)
-            
-            # Polígono Estrecho (Zona de medición)
-            W_estrecho = W * 0.60
-            hex_pts_suave = np.array([
-                [fix_x + L * v_long_x, fix_y + L * v_long_y],
-                [fix_x + (L/2) * v_long_x + W_estrecho * v_trans_x, fix_y + (L/2) * v_long_y + W_estrecho * v_trans_y],
-                [fix_x - (L/2) * v_long_x + W_estrecho * v_trans_x, fix_y - (L/2) * v_long_y + W_estrecho * v_trans_y],
-                [fix_x - L * v_long_x, fix_y - L * v_long_y],
-                [fix_x - (L/2) * v_long_x - W_estrecho * v_trans_x, fix_y - (L/2) * v_long_y - W_estrecho * v_trans_y],
-                [fix_x + (L/2) * v_long_x - W_estrecho * v_trans_x, fix_y + (L/2) * v_long_y - W_estrecho * v_trans_y]
-            ], np.int32)
-            hex_mask_2 = np.zeros(frame.shape[:2], dtype=np.uint8)
-            cv2.fillPoly(hex_mask_2, [hex_pts_suave], 255)
-
-            # ========================================================
-            # 3. EL KIT HACE LA MAGIA (Delega todo el tratamiento)
-            # ========================================================
-            mask_filtrada, img_tratada, mascara_naranja = procesador.procesar(
-                frame, self.config, hexagon_mask, hex_mask_2
+            # --- PROCESAMIENTO ---
+            mask_rastreo, img_tratada, _ = procesador.procesar(
+                frame, self.config, self.hex_solido_maestro, hex_suave
             )
 
-            # --- DIBUJOS Y ANÁLISIS ---
+            # --- TOLERANCIA INTELIGENTE BASADA EN LA MEDIANA ---
+            # 1. Extraemos solo el rectángulo donde existe el hexágono
+            y1_h, y2_h, x1_h, x2_h = self.roi_hex_coords
+            roi_tratada = img_tratada[y1_h:y2_h, x1_h:x2_h]
+            roi_mask = self.hex_solido_maestro[y1_h:y2_h, x1_h:x2_h]
+            
+            # 2. Obtenemos las métricas de luz de los píxeles del corazón
+            pixeles_corazon = roi_tratada[roi_mask > 0]
+            if len(pixeles_corazon) > 0:
+                mediana_luz = np.mean(pixeles_corazon)
+                max_luz = np.max(pixeles_corazon)
+            else:
+                mediana_luz, max_luz = 127, 255
+                
+            # 3. Mapeo Cuantizado del Slider (1 a 100)
+            # 50  = Mediana estricta
+            # 100 = Píxel más claro (Solo sobrevive el pico máximo)
+            # 1   = Reflejo hacia las sombras (Mediana - (Max - Mediana))
+            val_slider = self.config.tolerancia
+            distancia_max = max_luz - mediana_luz
 
-            if self.config.mostrar_elipse:
-                cv2.polylines(frame, [hex_pts], True, (100, 100, 100), t_fino)
+            if val_slider >= 50:
+                porcentaje = math.cbrt((val_slider - 50) / 50.0)
+                umbral_dinamico = mediana_luz + (distancia_max * porcentaje)
+            else:
+                porcentaje = (50 - val_slider) / 49.0
+                umbral_dinamico = mediana_luz - (distancia_max * porcentaje)
+                
+            umbral_dinamico = np.clip(umbral_dinamico, 0, 255)
+            _, mask_medicion = cv2.threshold(img_tratada, umbral_dinamico, 255, cv2.THRESH_BINARY)
 
-            dxc, dyc = 1000 * math.sin(rad_cyan), 1000 * math.cos(rad_cyan)
-            if self.config.mostrar_cyan:
-                cv2.line(frame, (int(fix_x - dxc), int(fix_y + dyc)), 
-                                (int(fix_x + dxc), int(fix_y - dyc)), (255, 255, 0), t_medio)
-
-            contornos, _ = cv2.findContours(mask_filtrada, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
+            # --- TANTEO DE CONFIANZA (OPTIMIZADO CON BOUNDING BOX) ---
+            contornos, _ = cv2.findContours(mask_rastreo, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             mejor_confianza = 0.0
 
-            if contornos and self.config.mostrar_rosa:
+            if contornos:
                 mayor = max(contornos, key=cv2.contourArea)
                 M = cv2.moments(mayor)
                 if M["m00"] != 0:
-                    base_cx = M["m10"]/M["m00"]
-                    base_cy = M["m01"]/M["m00"]
+                    base_cx, base_cy = M["m10"]/M["m00"], M["m01"]/M["m00"]
 
-                    # --- CORRECCIÓN AQUÍ: Usamos mask_filtrada como lienzo ---
-                    tejido_puro = np.zeros_like(mask_filtrada)
+                    tejido_puro = np.zeros_like(mask_rastreo)
                     cv2.drawContours(tejido_puro, [mayor], -1, 255, thickness=cv2.FILLED)
-                    h_m, w_m = tejido_puro.shape
 
-                    # Tanteo Multi-Eje (Rastreo)
-                    perp_dx, perp_dy = math.cos(rad_cyan), -math.sin(rad_cyan)
                     ganador_cx, ganador_cy = base_cx, base_cy
                     desplazamientos = [-15, -5, 0, 5, 15]
+                    
+                    nx, ny = -v_long_y, v_long_x 
+
+                    # Aceleración Extrema: Calculamos ROI basado en el corazón para saltarnos el fondo 4K
+                    bx, by, bw, bh = cv2.boundingRect(mayor)
+                    pad = max(30, int(w_f * 0.05)) # Margen para permitir el movimiento lateral
+                    y1 = max(0, by - pad)
+                    y2 = min(h_f, by + bh + pad)
+                    x1 = max(0, bx - pad)
+                    x2 = min(w_f, bx + bw + pad)
+                    
+                    tejido_puro_roi = tejido_puro[y1:y2, x1:x2].astype(np.float32) / 255.0
+                    X_roi, Y_roi = np.meshgrid(np.arange(x1, x2), np.arange(y1, y2))
 
                     for offset in desplazamientos:
-                        test_cx = base_cx + perp_dx * offset
-                        test_cy = base_cy + perp_dy * offset
-
-                        line_mask = np.ones((h_m, w_m), dtype=np.uint8) * 255
-                        cv2.line(line_mask, (int(test_cx - dxc), int(test_cy + dyc)), 
-                                            (int(test_cx + dxc), int(test_cy - dyc)), 0, 1)
-                        dist_map = cv2.distanceTransform(line_mask, cv2.DIST_L2, 3)
-                        mapa_pesos = np.exp(-0.5 * (dist_map / 10.0)**4).astype(np.float32)
+                        test_cx = base_cx + v_trans_x * offset
+                        test_cy = base_cy + v_trans_y * offset
 
                         cos2a, sin2a = math.cos(2 * rad_cyan), math.sin(2 * rad_cyan)
                         tx = test_cx - test_cx * cos2a - test_cy * sin2a
                         ty = test_cy - test_cx * sin2a + test_cy * cos2a
                         
                         matriz_espejo = np.float32([[cos2a, sin2a, tx], [sin2a, -cos2a, ty]])
-                        tejido_reflejado = cv2.warpAffine(tejido_puro, matriz_espejo, (w_m, h_m))
+                        tejido_reflejado = cv2.warpAffine(tejido_puro, matriz_espejo, (w_f, h_f))
 
-                        peso_inter = np.sum((cv2.bitwise_and(tejido_puro, tejido_reflejado).astype(np.float32) / 255.0) * mapa_pesos)
-                        peso_union = np.sum((cv2.bitwise_or(tejido_puro, tejido_reflejado).astype(np.float32) / 255.0) * mapa_pesos)
+                        # Solo comparamos en el recuadro del corazón (ROI)
+                        tejido_ref_roi = tejido_reflejado[y1:y2, x1:x2].astype(np.float32) / 255.0
+
+                        # AND y OR matemáticos ultra rápidos
+                        roi_inter = tejido_puro_roi * tejido_ref_roi
+                        roi_union = np.maximum(tejido_puro_roi, tejido_ref_roi)
+                        
+                        # Distancia de Gauss al vuelo
+                        dist_map_roi = np.abs((X_roi - test_cx)*nx + (Y_roi - test_cy)*ny)
+                        mapa_pesos_roi = np.exp(-0.5 * (dist_map_roi / 10.0)**4)
+                        
+                        peso_inter = np.sum(roi_inter * mapa_pesos_roi)
+                        peso_union = np.sum(roi_union * mapa_pesos_roi)
                         
                         if peso_union > 0:
                             factor_castigo = math.exp(-0.5 * (offset / 15.0)**2)
@@ -169,70 +267,54 @@ class VideoWorker(QObject):
                                 mejor_confianza = confianza_actual
                                 ganador_cx, ganador_cy = test_cx, test_cy
 
-                    self.historial_cx.append(ganador_cx)
-                    self.historial_cy.append(ganador_cy)
+                    # --- JERARQUÍA DE EJES ---
+                    self.historial_cx.append(ganador_cx); self.historial_cy.append(ganador_cy)
+                    cx_verde = np.median(self.historial_cx)
+                    cy_verde = np.median(self.historial_cy)
 
-                    media_ponderada_x = (2 * fix_x + ganador_cx) / 3.0
-                    media_ponderada_y = (2 * fix_y + ganador_cy) / 3.0
-                    
-                    self.historial_rojo_x.append(media_ponderada_x)
-                    self.historial_rojo_y.append(media_ponderada_y)
-                    
+                    media_x = (2.0 * fijo_x + cx_verde) / 3.0
+                    media_y = (2.0 * fijo_y + cy_verde) / 3.0
+                    self.historial_rojo_x.append(media_x); self.historial_rojo_y.append(media_y)
                     cx_rojo = int(np.median(self.historial_rojo_x))
                     cy_rojo = int(np.median(self.historial_rojo_y))
 
-                    # Eje Rojo Definitivo
-                    cv2.line(frame, (int(cx_rojo - dxc), int(cy_rojo + dyc)), 
-                                    (int(cx_rojo + dxc), int(cy_rojo - dyc)), (0, 0, 255), t_grueso)
+                    if self.config.mostrar_rosa:
+                        cv2.line(frame, (int(cx_verde - lx), int(cy_verde - ly)), 
+                                        (int(cx_verde + lx), int(cy_verde + ly)), (0, 255, 0), 1)
 
-                    # ESCÁNER TRANSVERSAL (Usando la Máscara 2 Suave)
-                    deg_rot = math.degrees(rad_cyan)
-                    M_rot = cv2.getRotationMatrix2D((cx_rojo, cy_rojo), deg_rot, 1.0)
-                    tejido_upright = cv2.warpAffine(mascara_naranja, M_rot, (w_m, h_m))
-                    
-                    pixeles_por_fila = np.sum(tejido_upright == 255, axis=1)
-                    
-                    if np.max(pixeles_por_fila) > 0:
-                        y_max_upright = np.argmax(pixeles_por_fila) 
-                        ancho_maximo = pixeles_por_fila[y_max_upright]
+                    if self.config.mostrar_elipse: 
+                        cv2.line(frame, (int(cx_rojo - lx), int(cy_rojo - ly)), 
+                                        (int(cx_rojo + lx), int(cy_rojo + ly)), (0, 0, 255), 3)
 
-                        M_inv = cv2.getRotationMatrix2D((cx_rojo, cy_rojo), -deg_rot, 1.0)
-                        pto_centro_upright = np.array([[[cx_rojo, y_max_upright]]], dtype=np.float32)
-                        pto_original = cv2.transform(pto_centro_upright, M_inv)[0][0]
-                        sec_x, sec_y = pto_original
+            # Dibujo de Extremos Superiores/Inferiores
+            for pt in self.extremos_corazon:
+                cv2.circle(frame, pt, max(4, int(w_f*0.005)), (0, 255, 255), -1)
 
-                        # Cruz Naranja Viva
-                        p1_sec = (int(sec_x - (ancho_maximo/2) * v_trans_x), int(sec_y - (ancho_maximo/2) * v_trans_y))
-                        p2_sec = (int(sec_x + (ancho_maximo/2) * v_trans_x), int(sec_y + (ancho_maximo/2) * v_trans_y))
-                        cv2.line(frame, p1_sec, p2_sec, (0, 165, 255), t_medio)
+            if self.config.mostrar_cyan:
+                cv2.line(frame, (int(fijo_x - lx), int(fijo_y - ly)), 
+                                (int(fijo_x + lx), int(fijo_y + ly)), (255, 255, 0), 1)
 
-                    # Enviamos estadísticas
-                    self.stats_ready.emit({"confianza": round(float(mejor_confianza), 1)})
+            self.stats_ready.emit({"confianza": round(float(mejor_confianza), 1)})
+
             # ========================================================
-            # 4. CONVERSIÓN SEGURA A PYQT PARA 4 PANTALLAS
+            # EMISIÓN A PANTALLAS
             # ========================================================
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            h_f, w_f, ch_f = rgb_frame.shape
-            qt_frame = QImage(rgb_frame.data, w_f, h_f, ch_f * w_f, QImage.Format.Format_RGB888).copy()
+            rgb_f = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            qt_f = QImage(rgb_f.data, w_f, h_f, 3 * w_f, QImage.Format.Format_RGB888).copy()
 
-            rgb_mask1 = cv2.cvtColor(mask_filtrada, cv2.COLOR_GRAY2RGB)
-            qt_mask1 = QImage(rgb_mask1.data, w_f, h_f, 3 * w_f, QImage.Format.Format_RGB888).copy()
+            rgb_m1 = cv2.cvtColor(mask_rastreo, cv2.COLOR_GRAY2RGB)
+            qt_m1 = QImage(rgb_m1.data, w_f, h_f, 3 * w_f, QImage.Format.Format_RGB888).copy()
 
-            # PANTALLA 3: Imagen Tratada Pesada (El Kit le aplicó el Desenfoque y el Hexágono)
-            rgb_tratada = cv2.cvtColor(img_tratada, cv2.COLOR_GRAY2RGB)
-            qt_tratada = QImage(rgb_tratada.data, w_f, h_f, 3 * w_f, QImage.Format.Format_RGB888).copy()
+            rgb_tr = cv2.cvtColor(img_tratada, cv2.COLOR_GRAY2RGB)
+            qt_tr = QImage(rgb_tr.data, w_f, h_f, 3 * w_f, QImage.Format.Format_RGB888).copy()
 
-            # PANTALLA 4: Máscara Simple (Solo Binarización)
-            rgb_mask2 = cv2.cvtColor(mascara_naranja, cv2.COLOR_GRAY2RGB)
-            qt_mask2 = QImage(rgb_mask2.data, w_f, h_f, 3 * w_f, QImage.Format.Format_RGB888).copy()
+            rgb_m2 = cv2.cvtColor(mask_medicion, cv2.COLOR_GRAY2RGB)
+            qt_m2 = QImage(rgb_m2.data, w_f, h_f, 3 * w_f, QImage.Format.Format_RGB888).copy()
 
-            self.frame_ready.emit(qt_frame, qt_mask1, qt_tratada, qt_mask2)
+            self.frame_ready.emit(qt_f, qt_m1, qt_tr, qt_m2)
 
             elapsed = time.time() - start_time
-            time.sleep(max(0, intervalo - elapsed))
+            time.sleep(max(0, (1.0/self.config.fps_objetivo) - elapsed))
 
         cap.release()
         self.finished.emit()
-
-    def stop(self):
-        self._running = False

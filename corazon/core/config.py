@@ -13,7 +13,7 @@ class TrackerConfig:
     sensibilidad: int = 35
     blur_imagen: int = 5
     desenfoque: int = 15      # El del hexágono suave (Screen 3)
-    tolerancia: int = 127     # El de binarización (Screen 4)
+    tolerancia: int = 50      # Centro dinámico (50 = Mediana)
     
     # --- MODULADORES KIT BIOLÓGICO (Los 4 Espacios Libres) ---
     # Estos valores se mapearán a tus sliders en la interfaz
