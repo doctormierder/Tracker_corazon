@@ -12,15 +12,19 @@ class TrackerConfig:
     # --- PARÁMETROS BASE (Sliders Generales) ---
     sensibilidad: int = 35
     blur_imagen: int = 5
-    desenfoque: int = 15      # El del hexágono suave (Screen 3)
-    tolerancia: int = 50      # Centro dinámico (50 = Mediana)
+    desenfoque: int = 0      # El del hexágono suave (Screen 3)
+    tolerancia: int = 70      # Centro dinámico (50 = Mediana)
     
     # --- MODULADORES KIT BIOLÓGICO (Los 4 Espacios Libres) ---
     # Estos valores se mapearán a tus sliders en la interfaz
-    bio_clahe: int = 0        # Espacio 1: ClipLimit de CLAHE (0-10)
-    bio_bilateral: int = 0    # Espacio 2: Fuerza del Filtro Bilateral (0-100)
+    bio_clahe: int = 1        # Espacio 1: ClipLimit de CLAHE (0-10)
+    bio_bilateral: int = 20    # Espacio 2: Fuerza del Filtro Bilateral (0-100)
     bio_tophat: int = 0       # Espacio 3: Tamaño del Kernel Top-Hat (0-50)
     bio_sobel: int = 0        # Espacio 4: Intensidad de Bordes Sobel (0-100)
+    
+    # --- NUEVOS MODULADORES ACTIVOS EN UI ---
+    bio_mediana: int = 3      # Nivel de filtro estática (impar)
+    bio_cierre: int = 3       # Nivel de relleno de agujeros
     
     # --- INTERRUPTORES VISUALES (Toggles) ---
     mostrar_cyan: bool = True

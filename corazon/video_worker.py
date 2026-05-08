@@ -175,36 +175,71 @@ class VideoWorker(QObject):
                 frame, self.config, self.hex_solido_maestro, hex_suave
             )
 
-            # --- TOLERANCIA INTELIGENTE BASADA EN LA MEDIANA ---
-            # 1. Extraemos solo el rectángulo donde existe el hexágono
+            # --- UMBRALIZACIÓN ADAPTATIVA POR FRANJAS PERPENDICULARES ---
+            # 1. Extracción de la zona de interés
             y1_h, y2_h, x1_h, x2_h = self.roi_hex_coords
             roi_tratada = img_tratada[y1_h:y2_h, x1_h:x2_h]
             roi_mask = self.hex_solido_maestro[y1_h:y2_h, x1_h:x2_h]
             
-            # 2. Obtenemos las métricas de luz de los píxeles del corazón
-            pixeles_corazon = roi_tratada[roi_mask > 0]
-            if len(pixeles_corazon) > 0:
-                mediana_luz = np.mean(pixeles_corazon)
-                max_luz = np.max(pixeles_corazon)
-            else:
-                mediana_luz, max_luz = 127, 255
-                
-            # 3. Mapeo Cuantizado del Slider (1 a 100)
-            # 50  = Mediana estricta
-            # 100 = Píxel más claro (Solo sobrevive el pico máximo)
-            # 1   = Reflejo hacia las sombras (Mediana - (Max - Mediana))
-            val_slider = self.config.tolerancia
-            distancia_max = max_luz - mediana_luz
+            # 2. Crear un sistema de coordenadas espaciales local
+            Y_roi, X_roi = np.indices(roi_tratada.shape)
+            X_global = X_roi + x1_h
+            Y_global = Y_roi + y1_h
+            
+            # 3. Proyectar cada píxel sobre el eje longitudinal del corazón
+            # Esto asigna un valor numérico a cada píxel indicando a qué "altura" del tubo está
+            proyeccion_long = (X_global * v_long_x) + (Y_global * v_long_y)
+            
+            pixeles_validos = roi_mask > 0
+            mask_medicion = np.zeros_like(img_tratada)
 
-            if val_slider >= 50:
-                porcentaje = math.cbrt((val_slider - 50) / 50.0)
-                umbral_dinamico = mediana_luz + (distancia_max * porcentaje)
-            else:
-                porcentaje = (50 - val_slider) / 49.0
-                umbral_dinamico = mediana_luz - (distancia_max * porcentaje)
+            if np.any(pixeles_validos):
+                proj_validas = proyeccion_long[pixeles_validos]
+                min_p, max_p = np.min(proj_validas), np.max(proj_validas)
                 
-            umbral_dinamico = np.clip(umbral_dinamico, 0, 255)
-            _, mask_medicion = cv2.threshold(img_tratada, umbral_dinamico, 255, cv2.THRESH_BINARY)
+                # Vamos a cortar el corazón en 8 "rodajas" (franjas)
+                num_franjas = 16
+                rango_franja = (max_p - min_p) / num_franjas
+                
+                # Creamos un "Mapa Topográfico de Umbrales"
+                mapa_umbrales = np.zeros_like(roi_tratada, dtype=np.float32)
+                val_slider = self.config.tolerancia
+
+                for i in range(num_franjas):
+                    lim_inf = min_p + i * rango_franja
+                    lim_sup = lim_inf + rango_franja if i < num_franjas - 1 else max_p + 1
+                    
+                    # Aislamos solo los píxeles de ESTA rodaja
+                    mask_franja = pixeles_validos & (proyeccion_long >= lim_inf) & (proyeccion_long < lim_sup)
+                    pixeles_franja = roi_tratada[mask_franja]
+                    
+                    if len(pixeles_franja) > 10:
+                        luz_fondo = np.percentile(pixeles_franja, 50)
+                        max_absoluto = np.percentile(pixeles_franja, 98) # Ignoramos ruido quemado
+                    else:
+                        luz_fondo, max_absoluto = 127, 255
+                        
+                    # Calculamos el umbral exclusivo para esta rodaja
+                    if val_slider >= 50:
+                        porcentaje = (val_slider - 50) / 50.0
+                        umbral_franja = luz_fondo + ((max_absoluto - luz_fondo) * porcentaje)
+                    else:
+                        porcentaje = (50 - val_slider) / 49.0
+                        distancia = max_absoluto - luz_fondo
+                        umbral_franja = luz_fondo - (distancia * porcentaje)
+                        
+                    # Asignamos este umbral al mapa topográfico
+                    mapa_umbrales[mask_franja] = np.clip(umbral_franja, 0, 255)
+
+                # 4. Difuminado del Mapa (Crucial)
+                # Difuminamos el mapa de umbrales para que no haya cortes duros o "escalones" entre las franjas
+                mapa_suave = cv2.GaussianBlur(mapa_umbrales, (19, 19), 0)
+                
+                # 5. Binarización Final (Cada píxel se compara con su propio umbral personalizado)
+                mask_medicion_roi = (roi_tratada >= mapa_suave).astype(np.uint8) * 255
+                mask_medicion_roi = cv2.bitwise_and(mask_medicion_roi, roi_mask)
+                
+                mask_medicion[y1_h:y2_h, x1_h:x2_h] = mask_medicion_roi
 
             # --- TANTEO DE CONFIANZA (OPTIMIZADO CON BOUNDING BOX) ---
             contornos, _ = cv2.findContours(mask_rastreo, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)

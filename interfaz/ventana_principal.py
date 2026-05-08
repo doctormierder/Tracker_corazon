@@ -47,11 +47,11 @@ class VentanaPrincipal(QMainWindow):
         self.lbl_bilateral = QLabel(f"Bilateral: {self.config.bio_bilateral}")
         grid_controles.addWidget(self.lbl_bilateral, 0, 3)
         
-        self.lbl_tophat = QLabel(f"Top-Hat: {self.config.bio_tophat}")
-        grid_controles.addWidget(self.lbl_tophat, 0, 4)
+        self.lbl_mediana = QLabel(f"Mediana: {self.config.bio_mediana}")
+        grid_controles.addWidget(self.lbl_mediana, 0, 4)
         
-        self.lbl_sobel = QLabel(f"Sobel: {self.config.bio_sobel}%")
-        grid_controles.addWidget(self.lbl_sobel, 0, 5)
+        self.lbl_cierre = QLabel(f"Cierre: {self.config.bio_cierre}")
+        grid_controles.addWidget(self.lbl_cierre, 0, 5)
 
         # Fila 1: Controles Reales
         self.slider_blur = QSlider(Qt.Orientation.Horizontal)
@@ -83,19 +83,19 @@ class VentanaPrincipal(QMainWindow):
         self.slider_bilateral.valueChanged.connect(self.al_cambiar_bilateral)
         grid_controles.addWidget(self.slider_bilateral, 1, 3)
 
-        # Slider Top-Hat (0 a 50)
-        self.slider_tophat = QSlider(Qt.Orientation.Horizontal)
-        self.slider_tophat.setRange(0, 200)
-        self.slider_tophat.setValue(self.config.bio_tophat)
-        self.slider_tophat.valueChanged.connect(self.al_cambiar_tophat)
-        grid_controles.addWidget(self.slider_tophat, 1, 4)
+        # Slider Filtro Mediana (1 a 21 - valores impares sugeridos)
+        self.slider_mediana = QSlider(Qt.Orientation.Horizontal)
+        self.slider_mediana.setRange(1, 21)
+        self.slider_mediana.setValue(self.config.bio_mediana)
+        self.slider_mediana.valueChanged.connect(self.al_cambiar_mediana)
+        grid_controles.addWidget(self.slider_mediana, 1, 4)
 
-        # Slider Sobel (0 a 100%)
-        self.slider_sobel = QSlider(Qt.Orientation.Horizontal)
-        self.slider_sobel.setRange(0, 200)
-        self.slider_sobel.setValue(self.config.bio_sobel)
-        self.slider_sobel.valueChanged.connect(self.al_cambiar_sobel)
-        grid_controles.addWidget(self.slider_sobel, 1, 5)
+        # Slider Cierre Morfológico (0 a 31)
+        self.slider_cierre = QSlider(Qt.Orientation.Horizontal)
+        self.slider_cierre.setRange(0, 31)
+        self.slider_cierre.setValue(self.config.bio_cierre)
+        self.slider_cierre.valueChanged.connect(self.al_cambiar_cierre)
+        grid_controles.addWidget(self.slider_cierre, 1, 5)
 
         layout_main.addWidget(panel_superior)
 
@@ -199,13 +199,16 @@ class VentanaPrincipal(QMainWindow):
         self.config.bio_bilateral = valor
         self.lbl_bilateral.setText(f"Bilateral: {valor}")
 
-    def al_cambiar_tophat(self, valor):
-        self.config.bio_tophat = valor
-        self.lbl_tophat.setText(f"Top-Hat: {valor}")
+    def al_cambiar_mediana(self, valor):
+        self.config.bio_mediana = valor
+        # Mostramos el valor impar real que usará OpenCV
+        val_real = valor if valor % 2 != 0 else valor + 1
+        self.lbl_mediana.setText(f"Mediana: {val_real if valor > 1 else 'Apagado'}")
 
-    def al_cambiar_sobel(self, valor):
-        self.config.bio_sobel = valor
-        self.lbl_sobel.setText(f"Sobel: {valor}%")
+    def al_cambiar_cierre(self, valor):
+        self.config.bio_cierre = valor
+        val_real = valor if valor % 2 != 0 else valor + 1
+        self.lbl_cierre.setText(f"Cierre: {val_real if valor > 0 else 'Apagado'}")
         
     def actualizar_metricas(self, stats):
         confianza = stats.get("confianza", 0)

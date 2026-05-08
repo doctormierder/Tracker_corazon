@@ -42,15 +42,31 @@ class KitBiologico(ProcesadorFrame):
             gray = cv2.addWeighted(gray, 1 - alpha, edges, alpha, 0)
 
         # --- TRATAMIENTO PARA PANTALLA 3 ---
-        # Aplicamos el desenfoque del hexágono para crear la "niebla"
         val_blur = config.desenfoque if config.desenfoque % 2 != 0 else config.desenfoque + 1
         hex_difuminado = cv2.GaussianBlur(hex_suave, (val_blur, val_blur), 0)
         
-        # Imagen Tratada: Píxeles procesados * Máscara de enfoque
+        # Imagen base tratada
         img_tratada = (gray.astype(np.float32) * (hex_difuminado.astype(np.float32) / 255.0)).astype(np.uint8)
 
-        # --- MÁSCARA SIMPLE PARA PANTALLA 4 ---
-        _, mask_medicion = cv2.threshold(img_tratada, config.tolerancia, 255, cv2.THRESH_BINARY)
+        # ========================================================
+        # 🧪 AUTO-LIMPIEZA BIOLÓGICA (Dinámica desde la UI)
+        # ========================================================
+        # 1. Filtro de Mediana (Mata la "estática" negra dentro de luz)
+        if config.bio_mediana > 1:
+            # OpenCV exige que el kernel de la mediana sea un número impar
+            k_med = config.bio_mediana if config.bio_mediana % 2 != 0 else config.bio_mediana + 1
+            img_tratada = cv2.medianBlur(img_tratada, k_med)
+        
+        # 2. Cierre Morfológico (Sella micro-grietas sin alterar bordes exteriores)
+        if config.bio_cierre > 0:
+            # Es mejor usar un kernel impar para que el centro sea exacto
+            k_cie = config.bio_cierre if config.bio_cierre % 2 != 0 else config.bio_cierre + 1
+            kernel_cierre = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_cie, k_cie))
+            img_tratada = cv2.morphologyEx(img_tratada, cv2.MORPH_CLOSE, kernel_cierre)
+        # ========================================================
+
+        # --- MÁSCARA SIMPLE PARA PANTALLA 4 (Se delegó al Video Worker) ---
+        mask_medicion = np.zeros_like(img_tratada) # Placeholder, el worker hace la real
         
         # Máscara de rastreo (usando la sensibilidad base)
         corte = max(0, np.max(gray) - config.sensibilidad)
