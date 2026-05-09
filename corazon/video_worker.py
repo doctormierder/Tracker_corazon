@@ -55,8 +55,11 @@ class VideoWorker(QObject):
         # =================================================================
         # FASE 0: GEOMETRÍA ANCLADA A LOS BORDES DE LA PANTALLA
         # =================================================================
+        # Busca donde llamas a la función:
         res = viaje_en_el_tiempo_definitivo(cap)
-        angulo_cyan, mascara_tiempo, fijo_x, fijo_y, _, _ = res
+        # Desempaquetamos los 8 valores (ahora incluimos p1 y p2)
+        (angulo_cyan, mascara_tiempo, fijo_x, fijo_y, 
+         self.eje_mayor, self.eje_menor, p1_calib, p2_calib) = res
 
         if mascara_tiempo is None:
             self.finished.emit()
@@ -84,7 +87,7 @@ class VideoWorker(QObject):
             largo_pantalla = math.hypot(p_a[0] - p_b[0], p_a[1] - p_b[1])
             
             # --- GEOMETRÍA: +20% de largo, 50% de ancho ---
-            L_h = largo_pantalla * 1.20 
+            L_h = largo_pantalla * 1.40 
             W_h = L_h * 0.50
             
             pts_hex = np.array([
@@ -322,12 +325,11 @@ class VideoWorker(QObject):
                                         (int(cx_rojo + lx), int(cy_rojo + ly)), (0, 0, 255), 3)
 
             # Dibujo de Extremos Superiores/Inferiores
-            for pt in self.extremos_corazon:
-                cv2.circle(frame, pt, max(4, int(w_f*0.005)), (0, 255, 255), -1)
-
-            if self.config.mostrar_cyan:
-                cv2.line(frame, (int(fijo_x - lx), int(fijo_y - ly)), 
-                                (int(fijo_x + lx), int(fijo_y + ly)), (255, 255, 0), 1)
+            cv2.circle(frame, p1_calib, max(6, int(w_f*0.007)), (0, 255, 255), -1)
+            cv2.circle(frame, p2_calib, max(6, int(w_f*0.007)), (0, 255, 255), -1)
+            
+            # Dibujamos una línea fina entre ellos para ver la distancia evaluada
+            cv2.line(frame, p1_calib, p2_calib, (0, 255, 255), 1)
 
             self.stats_ready.emit({"confianza": round(float(mejor_confianza), 1)})
 
