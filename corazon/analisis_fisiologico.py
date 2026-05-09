@@ -1,143 +1,174 @@
-# corazon/analisis_fisiologico.py
 import numpy as np
 import cv2
 import math
 import time
 from collections import deque
 
-# =================================================================
-# 🛠️ SECCIÓN EDITABLE: LÓGICA DE MEDICIÓN DE ANCHO
-# =================================================================
-def calcular_ancho_instante(mask, p1, p2, angulo_deg, num_rebanadas=10):
+def calcular_ancho_instante(mask, p1, p2, angulo_deg_ignorado, num_rebanadas=10):
     """
-    Esta es la parte que más editaremos. 
-    Mide el ancho promedio del tejido a lo largo del eje.
+    Mide el ancho del tejido utilizando Álgebra Lineal pura y Raycasting.
+    Ignoramos el ángulo externo para evitar desfasajes trigonométricos.
     """
     if mask is None or np.sum(mask) == 0:
-        return 0
+        return 0, None
+    
+    h, w = mask.shape
+    dx = p2[0] - p1[0]
+    dy = p2[1] - p1[1]
+    largo_eje = math.hypot(dx, dy)
+    
+    if largo_eje == 0:
+        return 0, None
+        
+    # 1. Vector unitario longitudinal y Perpendicular Estricta
+    ux, uy = dx / largo_eje, dy / largo_eje
+    px, py = -uy, ux 
+    
+    # Rango máximo de búsqueda (mitad de la pantalla por seguridad)
+    dist_max = int(math.hypot(w, h) / 2)
     
     anchos = []
-    # Generamos puntos a lo largo del eje longitudinal
+    puntos_linea_debug = None
+    
+    # 2. Análisis por rebanadas
     for i in range(1, num_rebanadas):
-        # Punto de interpolación en el eje (de 10% a 90% del largo)
         t = i / num_rebanadas
-        cx = int(p1[0] + (p2[0] - p1[0]) * t)
-        cy = int(p1[1] + (p2[1] - p1[1]) * t)
+        cx = int(p1[0] + dx * t)
+        cy = int(p1[1] + dy * t)
         
-        # Angulo perpendicular para medir el ancho
-        rad_perp = math.radians(angulo_deg + 90)
+        # Generar rayo de coordenadas (desde -dist_max hasta +dist_max)
+        r = np.arange(-dist_max, dist_max + 1)
+        x_coords = np.clip(np.round(cx + r * px).astype(int), 0, w - 1)
+        y_coords = np.clip(np.round(cy + r * py).astype(int), 0, h - 1)
         
-        # Trazamos una línea perpendicular "infinita" (ancho de búsqueda)
-        # Usamos 200px a cada lado como margen de seguridad
-        dist_busqueda = 200 
-        x1 = int(cx - dist_busqueda * math.cos(rad_perp))
-        y1 = int(cy - dist_busqueda * math.sin(rad_perp))
-        x2 = int(cx + dist_busqueda * math.cos(rad_perp))
-        y2 = int(cy + dist_busqueda * math.sin(rad_perp))
+        # Extraer los valores de los píxeles directamente de la matriz (Ultra rápido)
+        perfil = mask[y_coords, x_coords]
+        idx_centro_matematico = dist_max 
         
-        # Creamos una micro-máscara para esta línea
-        line_mask = np.zeros_like(mask)
-        cv2.line(line_mask, (x1, y1), (x2, y2), 255, 1)
-        
-        # Intersección de la línea con el tejido real
-        interseccion = cv2.bitwise_and(mask, line_mask)
-        puntos_blancos = np.where(interseccion > 0)
-        
-        if len(puntos_blancos[0]) > 1:
-            # Distancia entre el primer y último píxel blanco en esa línea
-            d = math.sqrt((puntos_blancos[1][0] - puntos_blancos[1][-1])**2 + 
-                          (puntos_blancos[0][0] - puntos_blancos[0][-1])**2)
-            anchos.append(d)
+        # Buscar la masa blanca más cercana al centro matemático
+        blancos = np.where(perfil > 0)[0]
+        if len(blancos) == 0:
+            continue # Rebanada vacía (fuera del tejido)
             
-    return np.mean(anchos) if anchos else 0
+        idx_ancla = blancos[np.argmin(np.abs(blancos - idx_centro_matematico))]
+        
+        # 3. Caminar hacia la derecha hasta tocar fondo (negro)
+        perfil_der = perfil[idx_ancla:]
+        ceros_der = np.where(perfil_der == 0)[0]
+        d_der = ceros_der[0] if len(ceros_der) > 0 else len(perfil_der) - 1
+        
+        # 4. Caminar hacia la izquierda hasta tocar fondo
+        perfil_izq = perfil[:idx_ancla+1][::-1]
+        ceros_izq = np.where(perfil_izq == 0)[0]
+        d_izq = ceros_izq[0] if len(ceros_izq) > 0 else len(perfil_izq) - 1
+        
+        ancho_rebanada = d_der + d_izq
+        anchos.append(ancho_rebanada)
+        
+        # 5. Guardar Puntos para Debuging (Asegura captura si la del medio falla)
+        if i == num_rebanadas // 2 or puntos_linea_debug is None:
+            r_der = r[idx_ancla + d_der]
+            r_izq = r[idx_ancla - d_izq]
+            pt_der = (int(cx + r_der * px), int(cy + r_der * py))
+            pt_izq = (int(cx + r_izq * px), int(cy + r_izq * py))
+            puntos_linea_debug = (pt_izq, pt_der)
+            
+    # Promedio de anchos limpios
+    return np.mean(anchos) if anchos else 0.0, puntos_linea_debug
 
-# =================================================================
-# 🧠 CLASE PROCESADORA (GESTIÓN DE SEÑALES)
-# =================================================================
 class AnalizadorFisiologico:
     def __init__(self):
-        # Buffers de datos
-        self.buffer_anchos = deque(maxlen=200) # Para el gráfico
-        self.buffer_tiempos = deque(maxlen=200)
+        self.buffer_anchos = deque(maxlen=300)
+        self.buffer_tiempos = deque(maxlen=300)
         
-        # Memoria de picos (Sístole/Diástole)
-        self.picos = []
-        self.valles = []
+        self.picos = []   
+        self.valles = []  
         self.tiempos_picos = []
-        
-        # Resultados finales
-        self.bpm_3 = 0
-        self.bpm_5 = 0
-        self.bpm_10 = 0
-        self.variacion_bpm = 0
-        self.ancho_max_promedio = 0
-        self.ancho_min_promedio = 0
+        self.bpms_historial = []
+
+        self.ancho_max_promedio = 0.0
+        self.ancho_min_promedio = 0.0
+        self.bpm_media = 0.0
+        self.variacion_bpm = 0.0
+
+        self.puntos_grafico = 200
+        self.sweep_y = np.zeros(self.puntos_grafico)
+        self.cursor_x = 0
 
     def procesar_frame(self, mask, p1, p2, angulo):
         t_actual = time.time()
-        ancho = calcular_ancho_instante(mask, p1, p2, angulo)
+        ancho, pts_debug = calcular_ancho_instante(mask, p1, p2, angulo)
         
-        self.buffer_anchos.append(ancho)
-        self.buffer_tiempos.append(t_actual)
-        
-        self._detectar_eventos()
-        self._calcular_metricas()
-        
-        return ancho
+        if ancho > 0:
+            self.buffer_anchos.append(ancho)
+            self.buffer_tiempos.append(t_actual)
+            self.sweep_y[self.cursor_x] = ancho
+            self.cursor_x = (self.cursor_x + 1) % self.puntos_grafico
+            self._detectar_eventos()
+            self._actualizar_atributos_directos()
+            
+        return ancho, pts_debug
 
     def _detectar_eventos(self):
-        """Detecta máximos y mínimos locales (latidos)"""
-        if len(self.buffer_anchos) < 5: return
-        
+        if len(self.buffer_anchos) < 10: return
         vals = list(self.buffer_anchos)
-        # Un pico es mayor que sus vecinos (ventana de 5)
-        if vals[-3] > vals[-4] and vals[-3] > vals[-2] and vals[-3] > np.mean(vals) * 1.05:
-            if not self.picos or (time.time() - self.tiempos_picos[-1] > 0.3): # Debounce 0.3s
-                self.picos.append(vals[-3])
-                self.tiempos_picos.append(self.buffer_tiempos[-3])
         
-        # Un valle es menor que sus vecinos
-        if vals[-3] < vals[-4] and vals[-3] < vals[-2] and vals[-3] < np.mean(vals) * 0.95:
+        # Pico (Sístole / Ancho Máximo)
+        if vals[-3] > vals[-5] and vals[-3] > vals[-1] and vals[-3] > np.mean(vals) * 1.02:
+            t_ahora = time.time()
+            if not self.tiempos_picos or (t_ahora - self.tiempos_picos[-1] > 0.25):
+                self.picos.append(vals[-3])
+                self.tiempos_picos.append(t_ahora)
+                if len(self.tiempos_picos) > 1:
+                    self.bpms_historial.append(60.0 / (self.tiempos_picos[-1] - self.tiempos_picos[-2]))
+        
+        # Valle (Diástole / Ancho Mínimo)
+        if vals[-3] < vals[-5] and vals[-3] < vals[-1] and vals[-3] < np.mean(vals) * 0.98:
             self.valles.append(vals[-3])
 
-    def _calcular_metricas(self):
-        # 1. Promedios de Sístole/Diástole
-        if self.picos: self.ancho_max_promedio = np.mean(self.picos[-10:])
-        if self.valles: self.ancho_min_promedio = np.mean(self.valles[-10:])
-        
-        # 2. Frecuencias (BPM)
-        if len(self.tiempos_picos) >= 2:
-            deltas = np.diff(self.tiempos_picos) # Diferencia en segundos entre latidos
-            bpms = 60.0 / deltas
-            
-            if len(bpms) >= 3: self.bpm_3 = np.mean(bpms[-3:])
-            if len(bpms) >= 5: self.bpm_5 = np.mean(bpms[-5:])
-            if len(bpms) >= 10: 
-                self.bpm_10 = np.mean(bpms[-10:])
-                # Variación (Desviación estándar de los últimos 10)
-                self.variacion_bpm = np.std(bpms[-10:])
+    def _actualizar_atributos_directos(self):
+        self.ancho_max_promedio = np.mean(self.picos[-10:]) if self.picos else 0.0
+        self.ancho_min_promedio = np.mean(self.valles[-10:]) if self.valles else 0.0
+        self.bpm_media = np.mean(self.bpms_historial[-10:]) if self.bpms_historial else 0.0
+        self.variacion_bpm = np.std(self.bpms_historial[-15:]) if len(self.bpms_historial) > 1 else 0.0
 
-    def generar_cardiograma(self, width=400, height=300):
-        """Crea el dibujo del osciloscopio para la Pantalla 2"""
+    def obtener_estadisticas(self):
+        avg = lambda lista, n: float(np.mean(lista[-n:])) if lista else 0.0
+        return {
+            "sys_1": avg(self.picos, 1), "sys_3": avg(self.picos, 3), "max_prom": self.ancho_max_promedio,
+            "dia_1": avg(self.valles, 1), "dia_3": avg(self.valles, 3), "min_prom": self.ancho_min_promedio,
+            "freq_2": avg(self.bpms_historial, 2), "freq_10": self.bpm_media,
+            "var_15": self.variacion_bpm
+        }
+
+    def generar_cardiograma(self, width, height):
         img = np.zeros((height, width, 3), dtype=np.uint8)
+        
+        step_w, step_h = width // 10, height // 8
+        for i in range(0, height, step_h): cv2.line(img, (0, i), (width, i), (20, 35, 20), 1)
+        for i in range(0, width, step_w): cv2.line(img, (i, 0), (i, height), (20, 35, 20), 1)
+
         if len(self.buffer_anchos) < 2: return img
         
-        # Dibujar rejilla de fondo
-        for i in range(0, height, 50): cv2.line(img, (0, i), (width, i), (30, 30, 30), 1)
+        vals_activos = self.sweep_y[self.sweep_y > 0]
+        min_v = np.min(vals_activos) if len(vals_activos) > 0 else 0
+        max_v = np.max(vals_activos) if len(vals_activos) > 0 else 1
+        rango = max(max_v - min_v, 15.0) 
         
-        # Escalar datos al alto del widget
-        max_v = max(self.buffer_anchos) if max(self.buffer_anchos) > 0 else 1
-        min_v = min(self.buffer_anchos)
-        rango = (max_v - min_v) if (max_v - min_v) > 0 else 1
-        
-        puntos = []
-        for i, val in enumerate(self.buffer_anchos):
-            x = int(i * (width / 200))
-            y = int(height - ((val - min_v) / rango * (height * 0.8) + height * 0.1))
-            puntos.append((x, y))
-        
-        # Dibujar la línea del latido (Verde neón)
-        for i in range(len(puntos)-1):
-            cv2.line(img, puntos[i], puntos[i+1], (0, 255, 100), 2)
+        dx = width / self.puntos_grafico
+        brecha = int(self.puntos_grafico * 0.08)
+
+        for i in range(self.puntos_grafico - 1):
+            if (self.cursor_x <= i <= self.cursor_x + brecha) or \
+               (self.cursor_x + brecha >= self.puntos_grafico and i < (self.cursor_x + brecha) % self.puntos_grafico):
+                continue
+            
+            if i == self.cursor_x - 1 or self.sweep_y[i] == 0 or self.sweep_y[i+1] == 0: 
+                continue
+
+            y1 = int(height - (((self.sweep_y[i] - min_v) / rango) * (height * 0.8) + height * 0.1))
+            y2 = int(height - (((self.sweep_y[i+1] - min_v) / rango) * (height * 0.8) + height * 0.1))
+            
+            cv2.line(img, (int(i*dx), y1), (int((i+1)*dx), y2), (0, 255, 100), 2)
             
         return img

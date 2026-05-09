@@ -5,8 +5,8 @@ from PyQt6.QtWidgets import (QMainWindow, QLabel, QVBoxLayout, QHBoxLayout,
                              QWidget, QPushButton, QGridLayout, QTextEdit, 
                              QListWidget, QSplitter, QTreeView,
                              QFrame, QAbstractItemView, QSlider, QGroupBox)
-from PyQt6.QtCore import QThread, Qt, QDir
-from PyQt6.QtGui import QPixmap, QDragEnterEvent, QDropEvent, QFileSystemModel
+from PyQt6.QtCore import QThread, Qt, QDir, pyqtSlot
+from PyQt6.QtGui import QPixmap, QDragEnterEvent, QDropEvent, QFileSystemModel, QImage
 
 from corazon.video_worker import VideoWorker
 from corazon.camera_worker import CameraWorker
@@ -28,7 +28,7 @@ class VentanaPrincipal(QMainWindow):
     def _construir_interfaz_profesional(self):
         widget_central = QWidget()
         self.setCentralWidget(widget_central)
-        layout_main = QVBoxLayout(widget_central) # Vertical principal
+        layout_main = QVBoxLayout(widget_central)
 
         # =================================================================
         # 1. BARRA SUPERIOR DE CONTROLES (2 Filas x 6 Columnas)
@@ -37,7 +37,7 @@ class VentanaPrincipal(QMainWindow):
         panel_superior.setStyleSheet("color: #ccc; font-weight: bold;")
         grid_controles = QGridLayout(panel_superior)
 
-        # Fila 0: Etiquetas (Ahora dinámicas para que actualicen el texto)
+        # Fila 0: Etiquetas
         grid_controles.addWidget(QLabel("Desenfoque (Blur)"), 0, 0)
         grid_controles.addWidget(QLabel("Tolerancia (Threshold)"), 0, 1)
         
@@ -53,7 +53,7 @@ class VentanaPrincipal(QMainWindow):
         self.lbl_cierre = QLabel(f"Cierre: {self.config.bio_cierre}")
         grid_controles.addWidget(self.lbl_cierre, 0, 5)
 
-        # Fila 1: Controles Reales
+        # Fila 1: Sliders
         self.slider_blur = QSlider(Qt.Orientation.Horizontal)
         self.slider_blur.setRange(1, 51)
         self.slider_blur.setValue(self.config.desenfoque)
@@ -62,35 +62,29 @@ class VentanaPrincipal(QMainWindow):
         grid_controles.addWidget(self.slider_blur, 1, 0)
 
         self.slider_tol = QSlider(Qt.Orientation.Horizontal)
-        self.slider_tol.setRange(1, 100) # Cuantizado del 1 al 100
+        self.slider_tol.setRange(1, 100)
         self.slider_tol.setValue(self.config.tolerancia)
         self.slider_tol.valueChanged.connect(self.al_cambiar_tolerancia)
         grid_controles.addWidget(self.slider_tol, 1, 1)
 
-        # --- REEMPLAZO DE LOS ESPACIOS VACÍOS POR LOS SLIDERS BIOLÓGICOS ---
-        
-        # Slider CLAHE (0 a 20 -> en el kit se divide a 0.0 - 10.0)
         self.slider_clahe = QSlider(Qt.Orientation.Horizontal)
         self.slider_clahe.setRange(0, 40)
         self.slider_clahe.setValue(self.config.bio_clahe)
         self.slider_clahe.valueChanged.connect(self.al_cambiar_clahe)
         grid_controles.addWidget(self.slider_clahe, 1, 2)
 
-        # Slider Bilateral (0 a 100)
         self.slider_bilateral = QSlider(Qt.Orientation.Horizontal)
         self.slider_bilateral.setRange(0, 200)
         self.slider_bilateral.setValue(self.config.bio_bilateral)
         self.slider_bilateral.valueChanged.connect(self.al_cambiar_bilateral)
         grid_controles.addWidget(self.slider_bilateral, 1, 3)
 
-        # Slider Filtro Mediana (1 a 21 - valores impares sugeridos)
         self.slider_mediana = QSlider(Qt.Orientation.Horizontal)
         self.slider_mediana.setRange(1, 21)
         self.slider_mediana.setValue(self.config.bio_mediana)
         self.slider_mediana.valueChanged.connect(self.al_cambiar_mediana)
         grid_controles.addWidget(self.slider_mediana, 1, 4)
 
-        # Slider Cierre Morfológico (0 a 31)
         self.slider_cierre = QSlider(Qt.Orientation.Horizontal)
         self.slider_cierre.setRange(0, 31)
         self.slider_cierre.setValue(self.config.bio_cierre)
@@ -110,12 +104,12 @@ class VentanaPrincipal(QMainWindow):
         self.layout_grid_videos.setSpacing(10)
 
         self.visor_video = self._crear_visor("1. VIDEO ORIGINAL", "#000")
-        self.visor_mask1 = self._crear_visor("2. MÁSCARA 1 (Rastreo)", "#111")
+        self.visor_ecg = self._crear_visor("2. ECG / CARDIOGRAMA", "#111") # <-- Cambio Crítico
         self.visor_tratada = self._crear_visor("3. IMAGEN TRATADA (Kit)", "#1a1a1a")
-        self.visor_mask2 = self._crear_visor("4. MÁSCARA 2 (Línea Naranja)", "#0a0a0a")
+        self.visor_mask2 = self._crear_visor("4. MÁSCARA DEFINITIVA", "#0a0a0a")
         
         self.layout_grid_videos.addWidget(self.visor_video, 0, 0)
-        self.layout_grid_videos.addWidget(self.visor_mask1, 0, 1)
+        self.layout_grid_videos.addWidget(self.visor_ecg, 0, 1)
         self.layout_grid_videos.addWidget(self.visor_tratada, 1, 0)
         self.layout_grid_videos.addWidget(self.visor_mask2, 1, 1)
 
@@ -123,18 +117,34 @@ class VentanaPrincipal(QMainWindow):
         barra_lateral = QWidget()
         layout_lateral = QVBoxLayout(barra_lateral)
 
-        # Dashboard Movido a la Barra Lateral
+        # Panel de Métricas Fisiológicas
         self.lbl_confianza = QLabel("Confianza Eje: 0.0%")
         self.lbl_confianza.setStyleSheet("color: white; font-size: 22px; font-weight: bold; background: #222; padding: 10px;")
         layout_lateral.addWidget(self.lbl_confianza)
 
+        estilo_metricas = "color: #00ff00; font-size: 14px; background: #1e1e1e; padding: 5px; font-family: Consolas;"
+        
+        self.lbl_ancho_inst = QLabel("Ancho Actual: 0.0 px")
+        self.lbl_ancho_inst.setStyleSheet(estilo_metricas)
+        layout_lateral.addWidget(self.lbl_ancho_inst)
 
-        self.consola_datos = QTextEdit()
-        self.consola_datos.setReadOnly(True)
-        self.consola_datos.setStyleSheet("background-color: #1e1e1e; color: #00ff00; font-family: 'Courier New';")
-        layout_lateral.addWidget(QLabel("💬 CONSOLA DE ANÁLISIS"))
-        layout_lateral.addWidget(self.consola_datos, stretch=3)
+        self.lbl_sys = QLabel("Sístole (1 | 3 | 10): 0.0 | 0.0 | 0.0")
+        self.lbl_sys.setStyleSheet(estilo_metricas)
+        layout_lateral.addWidget(self.lbl_sys)
 
+        self.lbl_dia = QLabel("Diástole (1 | 3 | 10): 0.0 | 0.0 | 0.0")
+        self.lbl_dia.setStyleSheet(estilo_metricas)
+        layout_lateral.addWidget(self.lbl_dia)
+
+        self.lbl_freq = QLabel("Frecuencia (2 | 10): 0.0 | 0.0 BPM")
+        self.lbl_freq.setStyleSheet(estilo_metricas)
+        layout_lateral.addWidget(self.lbl_freq)
+
+        self.lbl_var = QLabel("Varianza (15): 0.0")
+        self.lbl_var.setStyleSheet(estilo_metricas)
+        layout_lateral.addWidget(self.lbl_var)
+
+        # Explorador
         self.model_fs = QFileSystemModel()
         self.model_fs.setRootPath("") 
         self.tree_explorer = QTreeView()
@@ -146,6 +156,7 @@ class VentanaPrincipal(QMainWindow):
         layout_lateral.addWidget(QLabel("📁 EXPLORADOR DE ARCHIVOS"))
         layout_lateral.addWidget(self.tree_explorer, stretch=4)
 
+        # Cola
         self.lista_cola = QListWidget()
         self.lista_cola.setStyleSheet("background-color: #2a2a2a; color: #3498db;")
         layout_lateral.addWidget(QLabel("📋 COLA DE PROCESAMIENTO"))
@@ -157,7 +168,7 @@ class VentanaPrincipal(QMainWindow):
         btn_play.setStyleSheet("background-color: #28a745; color: white; padding: 8px;")
         btn_play.clicked.connect(self.reproducir_de_cola)
         
-        btn_borrar = QPushButton("🗑")
+        btn_borrar = QPushButton("🗑 QUITAR")
         btn_borrar.clicked.connect(self.quitar_de_cola)
         layout_botones.addWidget(btn_play)
         layout_botones.addWidget(btn_borrar)
@@ -167,7 +178,7 @@ class VentanaPrincipal(QMainWindow):
         btn_camara.clicked.connect(self.iniciar_camara)
         layout_lateral.addWidget(btn_camara)
 
-        # Ensamblar
+        # Ensamblar Splitter
         self.splitter.addWidget(contenedor_izquierdo)
         self.splitter.addWidget(barra_lateral)
         self.splitter.setStretchFactor(0, 3)
@@ -182,10 +193,9 @@ class VentanaPrincipal(QMainWindow):
         return label
 
     # =================================================================
-    # LÓGICA DE INTERFAZ Y ACTUALIZACIONES
+    # SLIDERS E INTERFAZ
     # =================================================================
     def al_cambiar_desenfoque(self, valor):
-        # Aseguramos que sea impar
         self.config.desenfoque = valor if valor % 2 != 0 else valor + 1
 
     def al_cambiar_tolerancia(self, valor):
@@ -201,7 +211,6 @@ class VentanaPrincipal(QMainWindow):
 
     def al_cambiar_mediana(self, valor):
         self.config.bio_mediana = valor
-        # Mostramos el valor impar real que usará OpenCV
         val_real = valor if valor % 2 != 0 else valor + 1
         self.lbl_mediana.setText(f"Mediana: {val_real if valor > 1 else 'Apagado'}")
 
@@ -210,27 +219,54 @@ class VentanaPrincipal(QMainWindow):
         val_real = valor if valor % 2 != 0 else valor + 1
         self.lbl_cierre.setText(f"Cierre: {val_real if valor > 0 else 'Apagado'}")
         
+    # =================================================================
+    # RECEPCIÓN DE DATOS (MULTIHILO)
+    # =================================================================
+    @pyqtSlot(dict)
     def actualizar_metricas(self, stats):
-        confianza = stats.get("confianza", 0)
-        color = "#00ff00" if confianza >= 85 else "#ffaa00" if confianza >= 50 else "#ff0000"
-        self.lbl_confianza.setText(f"Confianza Eje: {confianza}%")
-        self.lbl_confianza.setStyleSheet(f"color: {color}; font-size: 24px; font-weight: bold;")
+        """Mapeo a prueba de fallos de los datos del Analizador Fisiológico"""
+        if "confianza" in stats:
+            self.lbl_confianza.setText(f"Confianza Eje: {stats['confianza']}%")
+            
+        if "ancho_actual" in stats:
+            self.lbl_ancho_inst.setText(f"Ancho Actual: {stats['ancho_actual']} px")
+            
+        if "sys_1" in stats:
+            sys_1 = round(stats.get('sys_1', 0), 1)
+            sys_3 = round(stats.get('sys_3', 0), 1)
+            sys_10 = round(stats.get('max_prom', 0), 1)
+            self.lbl_sys.setText(f"Sístole (1 | 3 | 10): {sys_1} | {sys_3} | {sys_10}")
 
-    def actualizar_pantallas(self, img_p, img_m1, img_tratada, img_m2):
+        if "dia_1" in stats:
+            dia_1 = round(stats.get('dia_1', 0), 1)
+            dia_3 = round(stats.get('dia_3', 0), 1)
+            dia_10 = round(stats.get('min_prom', 0), 1)
+            self.lbl_dia.setText(f"Diástole (1 | 3 | 10): {dia_1} | {dia_3} | {dia_10}")
+
+        if "freq_2" in stats:
+            f_2 = round(stats.get('freq_2', 0), 1)
+            f_10 = round(stats.get('freq_10', 0), 1)
+            self.lbl_freq.setText(f"Frecuencia (2 | 10): {f_2} | {f_10} BPM")
+
+        if "var_15" in stats:
+            var_15 = round(stats.get('var_15', 0), 2)
+            self.lbl_var.setText(f"Varianza (15): {var_15}")
+
+    @pyqtSlot(QImage, QImage, QImage, QImage)
+    def actualizar_pantallas(self, qt_f, qt_ecg, qt_tratada, qt_m2):
+        """Limpieza y eficiencia total en la asignación de pixmaps"""
         def escalar(label, img):
+            if img.isNull(): return QPixmap()
             pix = QPixmap.fromImage(img)
             return pix.scaled(label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
 
-        self.visor_video.setPixmap(escalar(self.visor_video, img_p))
-        self.visor_mask1.setPixmap(escalar(self.visor_mask1, img_m1))
-        self.visor_tratada.setPixmap(escalar(self.visor_tratada, img_tratada)) # Pantalla 3
-        self.visor_mask2.setPixmap(escalar(self.visor_mask2, img_m2))         # Pantalla 4
-        self.visor_video.setPixmap(escalar(self.visor_video, img_p))
-        self.visor_mask1.setPixmap(escalar(self.visor_mask1, img_m1))
-        self.visor_mask2.setPixmap(escalar(self.visor_mask2, img_m2))
+        self.visor_video.setPixmap(escalar(self.visor_video, qt_f))
+        self.visor_ecg.setPixmap(escalar(self.visor_ecg, qt_ecg))
+        self.visor_tratada.setPixmap(escalar(self.visor_tratada, qt_tratada))
+        self.visor_mask2.setPixmap(escalar(self.visor_mask2, qt_m2))
 
     # =================================================================
-    # GESTIÓN DE ARCHIVOS Y WORKERS (El código que ya tenías)
+    # GESTIÓN DE COLAS Y WORKERS
     # =================================================================
     def agregar_a_cola(self, ruta):
         ext = ('.mp4', '.avi', '.mpg', '.mpeg', '.mov')
@@ -238,7 +274,6 @@ class VentanaPrincipal(QMainWindow):
             items = [self.lista_cola.item(i).text() for i in range(self.lista_cola.count())]
             if ruta not in items:
                 self.lista_cola.addItem(ruta)
-                self.consola_datos.append(f">> Añadido a cola: {os.path.basename(ruta)}")
 
     def archivo_explorer_a_cola(self, index):
         ruta = self.model_fs.filePath(index)
@@ -247,6 +282,11 @@ class VentanaPrincipal(QMainWindow):
 
     def reproducir_de_cola(self):
         item = self.lista_cola.currentItem()
+        # Si no hay selección pero la cola tiene elementos, fuerza el primero
+        if not item and self.lista_cola.count() > 0:
+            item = self.lista_cola.item(0)
+            self.lista_cola.setCurrentItem(item)
+            
         if item:
             self._detener_trabajador_actual()
             self.thread = QThread()
@@ -267,13 +307,25 @@ class VentanaPrincipal(QMainWindow):
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         
-        # Conectamos las 3 pantallas y las métricas
+        # Conexiones explícitas de señales
         if hasattr(self.worker, 'frame_ready'):
             self.worker.frame_ready.connect(self.actualizar_pantallas)
         if hasattr(self.worker, 'stats_ready'):
             self.worker.stats_ready.connect(self.actualizar_metricas)
             
+        # Sistema de Autoplay para continuar con la cola
+        if hasattr(self.worker, 'finished'):
+            self.worker.finished.connect(self._video_terminado)
+            
         self.thread.start()
+
+    @pyqtSlot()
+    def _video_terminado(self):
+        self._detener_trabajador_actual()
+        # Elimina el que se estaba reproduciendo y avanza
+        if self.lista_cola.count() > 0:
+            self.lista_cola.takeItem(0) 
+            self.reproducir_de_cola()
 
     def _detener_trabajador_actual(self):
         if self.worker:
