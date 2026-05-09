@@ -10,6 +10,7 @@ from collections import deque
 from .buscando_eje import viaje_en_el_tiempo_definitivo
 from .core.config import TrackerConfig
 from .core.kit_procesamiento import SelectorKits
+from .analisis_fisiologico import AnalizadorFisiologico
 
 class VideoWorker(QObject):
     """
@@ -29,6 +30,7 @@ class VideoWorker(QObject):
         self.video_path = video_path
         self.config = config
         self._running = True
+        self.analizador = AnalizadorFisiologico()
     
         # Sistema de Fricción (Jerarquía de Ejes)
         self.historial_cx = deque(maxlen=10)
@@ -196,6 +198,24 @@ class VideoWorker(QObject):
             pixeles_validos = roi_mask > 0
             mask_medicion = np.zeros_like(img_tratada)
 
+            # 1. Ejecutar análisis fisiológico
+            ancho_actual = self.analizador.procesar_frame(mask_medicion, 
+                                                        (p1_calib), (p2_calib), 
+                                                        angulo_cyan)
+
+            # 2. Generar el cardiograma para la Pantalla 2
+            img_cardiograma = self.analizador.generar_cardiograma(w_f, h_f)
+
+            # 3. Preparar métricas para la UI
+            self.stats_ready.emit({
+                "ancho_inst": round(ancho_actual, 2),
+                "max_prom": round(self.analizador.ancho_max_promedio, 2),
+                "min_prom": round(self.analizador.ancho_min_promedio, 2),
+                "bpm_3": int(self.analizador.bpm_3),
+                "bpm_10": int(self.analizador.bpm_10),
+                "variacion": round(self.analizador.variacion_bpm, 1)
+            })
+
             if np.any(pixeles_validos):
                 proj_validas = proyeccion_long[pixeles_validos]
                 min_p, max_p = np.min(proj_validas), np.max(proj_validas)
@@ -339,8 +359,8 @@ class VideoWorker(QObject):
             rgb_f = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             qt_f = QImage(rgb_f.data, w_f, h_f, 3 * w_f, QImage.Format.Format_RGB888).copy()
 
-            rgb_m1 = cv2.cvtColor(mask_rastreo, cv2.COLOR_GRAY2RGB)
-            qt_m1 = QImage(rgb_m1.data, w_f, h_f, 3 * w_f, QImage.Format.Format_RGB888).copy()
+            rgb_cardio = cv2.cvtColor(img_cardiograma, cv2.COLOR_BGR2RGB)
+            qt_cardio = QImage(rgb_cardio.data, w_f, h_f, 3 * w_f, QImage.Format.Format_RGB888).copy()
 
             rgb_tr = cv2.cvtColor(img_tratada, cv2.COLOR_GRAY2RGB)
             qt_tr = QImage(rgb_tr.data, w_f, h_f, 3 * w_f, QImage.Format.Format_RGB888).copy()
@@ -348,7 +368,7 @@ class VideoWorker(QObject):
             rgb_m2 = cv2.cvtColor(mask_medicion, cv2.COLOR_GRAY2RGB)
             qt_m2 = QImage(rgb_m2.data, w_f, h_f, 3 * w_f, QImage.Format.Format_RGB888).copy()
 
-            self.frame_ready.emit(qt_f, qt_m1, qt_tr, qt_m2)
+            self.frame_ready.emit(qt_f, qt_cardio, qt_tr, qt_m2)
 
             elapsed = time.time() - start_time
             time.sleep(max(0, (1.0/self.config.fps_objetivo) - elapsed))
