@@ -25,7 +25,10 @@ def viaje_en_el_tiempo_definitivo(cap):
         ret, frame = cap.read()
         if not ret: continue
             
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if len(frame.shape) == 2 or frame.shape[2] == 1:
+            gray = frame  # Ya nos llegó en escala de grises
+        else:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (7, 7), 0)
         blanco_max = np.max(blurred)
         
@@ -71,10 +74,10 @@ def viaje_en_el_tiempo_definitivo(cap):
     # =================================================================
     # 🐛 DEBUG: VER LA MÁSCARA DEL TIEMPO (Descomentar para probar)
     # =================================================================
-    cv2.imshow("DEBUG - Mascara del Tiempo", mascara_tiempo)
+    # cv2.imshow("DEBUG - Mascara del Tiempo", mascara_tiempo)
     # print("👁️ Viendo máscara... Presiona CUALQUIER TECLA en la ventana de la imagen para continuar.")
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
+    # cv2.waitKey(0)
+    # cv2.destroyAllWindows()
     # =================================================================
     
     # --- 2. ESCÁNER CYAN (AHORA 100% RELATIVO A LA RESOLUCIÓN) ---

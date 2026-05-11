@@ -2,6 +2,7 @@
 import cv2
 import time
 import math
+import sys
 import numpy as np
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QImage
@@ -75,8 +76,18 @@ class VideoWorker(QObject):
 
     @pyqtSlot()
     def run(self):
+        # Selección dinámica de motor según el Sistema Operativo
         cap = cv2.VideoCapture(self.video_path)
+        
+        # Detectamos si estamos en Linux lidiando con el formato problemático
+        es_mpg_linux = sys.platform.startswith("linux") and self.video_path.lower().endswith(('.mpg', '.mpeg'))
+        
+        if es_mpg_linux:
+            # APAGAMOS EL SWSCLALER: Le pedimos a OpenCV la matriz YUV cruda (sin convertir)
+            cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
+
         if not cap.isOpened():
+            print(f"Error: OpenCV no pudo abrir {self.video_path}.")
             self.finished.emit()
             return
 
@@ -156,6 +167,28 @@ class VideoWorker(QObject):
                 continue
 
             h_f_actual, w_f_actual = frame.shape[:2]
+
+                
+            # --- BYPASS DE DECODIFICACIÓN MANUAL PARA LINUX ---
+            # --- BYPASS DE DECODIFICACIÓN MANUAL PARA LINUX ---
+            if es_mpg_linux:
+                # Si OpenCV nos tiró la toalla y nos dio un 8UC1 (Gris puro)
+                if len(frame.shape) == 2 or frame.shape[2] == 1:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                else:
+                    try:
+                        frame = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
+                    except cv2.error:
+                        try:
+                            frame = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_NV12)
+                        except cv2.error:
+                            break
+
+                
+            # =======================================================
+            # DE AQUÍ EN ADELANTE, ES TU CÓDIGO DE SIEMPRE
+            # img_cv = frame.copy() ...
+            # =======================================================
 
             # --- 1.1 CACHÉ DE DESENFOQUE ---
             if self._last_blur_val != self.config.desenfoque:
