@@ -2,6 +2,7 @@
 import cv2
 import time
 import math
+import sys
 import numpy as np
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QImage
@@ -75,8 +76,18 @@ class VideoWorker(QObject):
 
     @pyqtSlot()
     def run(self):
+        # Selección dinámica de motor según el Sistema Operativo
         cap = cv2.VideoCapture(self.video_path)
+        
+        # Detectamos si estamos en Linux lidiando con el formato problemático
+        es_mpg_linux = sys.platform.startswith("linux") and self.video_path.lower().endswith(('.mpg', '.mpeg'))
+        
+        if es_mpg_linux:
+            # APAGAMOS EL SWSCLALER: Le pedimos a OpenCV la matriz YUV cruda (sin convertir)
+            cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
+
         if not cap.isOpened():
+            print(f"Error: OpenCV no pudo abrir {self.video_path}.")
             self.finished.emit()
             return
 
@@ -156,6 +167,28 @@ class VideoWorker(QObject):
                 continue
 
             h_f_actual, w_f_actual = frame.shape[:2]
+
+                
+            # --- BYPASS DE DECODIFICACIÓN MANUAL PARA LINUX ---
+            # --- BYPASS DE DECODIFICACIÓN MANUAL PARA LINUX ---
+            if es_mpg_linux:
+                # Si OpenCV nos tiró la toalla y nos dio un 8UC1 (Gris puro)
+                if len(frame.shape) == 2 or frame.shape[2] == 1:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                else:
+                    try:
+                        frame = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
+                    except cv2.error:
+                        try:
+                            frame = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_NV12)
+                        except cv2.error:
+                            break
+
+                
+            # =======================================================
+            # DE AQUÍ EN ADELANTE, ES TU CÓDIGO DE SIEMPRE
+            # img_cv = frame.copy() ...
+            # =======================================================
 
             # --- 1.1 CACHÉ DE DESENFOQUE ---
             if self._last_blur_val != self.config.desenfoque:
@@ -240,9 +273,9 @@ class VideoWorker(QObject):
                 cv2.circle(frame, pts_debug[0], radio_debug, (255, 255, 255), -1)
                 cv2.circle(frame, pts_debug[1], radio_debug, (255, 255, 255), -1)
 
-            # --- 1.5 CÁLCULO DE SIMETRÍA INSTANTÁNEA (IoU puro, sin promedios temporales) ---
-            contornos, _ = cv2.findContours(mask_rastreo, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            mejor_confianza = 0.0
+            # --- 1.5 CÁLCULO DE POSICIÓN ÓPTIMA (Puntuación por Línea Gruesa) ---
+            # ¡CAMBIO APLICADO! Ahora usamos mask_medicion (la de la Pantalla 4)
+            contornos, _ = cv2.findContours(mask_medicion, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
             if contornos:
                 mayor = max(contornos, key=cv2.contourArea)
@@ -250,50 +283,43 @@ class VideoWorker(QObject):
                 if M["m00"] != 0:
                     base_cx, base_cy = M["m10"]/M["m00"], M["m01"]/M["m00"]
 
-                    tejido_puro = np.zeros_like(mask_rastreo)
-                    cv2.drawContours(tejido_puro, [mayor], -1, 255, thickness=cv2.FILLED)
-
                     ganador_cx, ganador_cy = base_cx, base_cy
-                    desplazamientos = [-15, -5, 0, 5, 15]
-                    nx, ny = -v_long_y, v_long_x 
-
+                    mejor_score = -float('inf')
+                    
+                    desplazamientos = [-15, -5, 0, 5, 15] 
+                    
                     bx, by, bw, bh = cv2.boundingRect(mayor)
                     pad = max(30, int(w_f_actual * 0.05)) 
                     y1 = max(0, by - pad); y2 = min(h_f_actual, by + bh + pad)
                     x1 = max(0, bx - pad); x2 = min(w_f_actual, bx + bw + pad)
                     
-                    tejido_puro_roi = tejido_puro[y1:y2, x1:x2].astype(np.float32) / 255.0
-                    X_roi, Y_roi = np.meshgrid(np.arange(x1, x2), np.arange(y1, y2))
+                    # ¡CAMBIO APLICADO! El recorte también se hace sobre mask_medicion
+                    roi_rastreo = mask_medicion[y1:y2, x1:x2]
+                    grosor_test = self.escalar_pixel(15, w_f_actual) 
 
                     for offset in desplazamientos:
                         test_cx = base_cx + v_trans_x * offset
                         test_cy = base_cy + v_trans_y * offset
 
-                        cos2a, sin2a = math.cos(2 * rad_cyan), math.sin(2 * rad_cyan)
-                        tx = test_cx - test_cx * cos2a - test_cy * sin2a
-                        ty = test_cy - test_cx * sin2a + test_cy * cos2a
+                        temp_roi = np.zeros_like(roi_rastreo)
+                        pt1_roi = (int(test_cx - lx) - x1, int(test_cy - ly) - y1)
+                        pt2_roi = (int(test_cx + lx) - x1, int(test_cy + ly) - y1)
                         
-                        matriz_espejo = np.float32([[cos2a, sin2a, tx], [sin2a, -cos2a, ty]])
-                        tejido_reflejado = cv2.warpAffine(tejido_puro, matriz_espejo, (w_f_actual, h_f_actual))
-                        tejido_ref_roi = tejido_reflejado[y1:y2, x1:x2].astype(np.float32) / 255.0
+                        cv2.line(temp_roi, pt1_roi, pt2_roi, 255, thickness=grosor_test)
 
-                        roi_inter = tejido_puro_roi * tejido_ref_roi
-                        roi_union = np.maximum(tejido_puro_roi, tejido_ref_roi)
+                        inter = cv2.bitwise_and(roi_rastreo, temp_roi)
+                        blancos = cv2.countNonZero(inter)
                         
-                        dist_map_roi = np.abs((X_roi - test_cx)*nx + (Y_roi - test_cy)*ny)
-                        mapa_pesos_roi = np.exp(-0.5 * (dist_map_roi / 10.0)**4)
+                        total_area_linea = cv2.countNonZero(temp_roi)
+                        negros = total_area_linea - blancos
                         
-                        peso_inter = np.sum(roi_inter * mapa_pesos_roi)
-                        peso_union = np.sum(roi_union * mapa_pesos_roi)
+                        score = (blancos * 9) - (negros * 40) - (abs(offset) * 9)
                         
-                        if peso_union > 0:
-                            factor_castigo = math.exp(-0.5 * (offset / 15.0)**2)
-                            confianza_actual = ((peso_inter / peso_union) * 100.0) * factor_castigo
-                            if confianza_actual > mejor_confianza:
-                                mejor_confianza = confianza_actual
-                                ganador_cx, ganador_cy = test_cx, test_cy
+                        if score > mejor_score:
+                            mejor_score = score
+                            ganador_cx, ganador_cy = test_cx, test_cy
 
-                    # Ejes visuales (Mantienen el suavizado visual para que no parpadeen, pero la matemática es pura)
+                    # --- Ejes visuales (Mantienen la inercia visual para el dibujo limpio) ---
                     self.historial_cx.append(ganador_cx); self.historial_cy.append(ganador_cy)
                     cx_verde = np.median(self.historial_cx)
                     cy_verde = np.median(self.historial_cy)
@@ -321,7 +347,7 @@ class VideoWorker(QObject):
 
             # --- 1.7 RECOPILACIÓN Y EMISIÓN DE MÉTRICAS ---
             stats = self.analizador.obtener_estadisticas()
-            stats["confianza"] = round(float(mejor_confianza), 1)
+            stats["confianza"] = round(float(0), 1)
             stats["ancho_actual"] = round(float(ancho_f), 2)
             # Inyectamos de forma explícita para asegurar compatibilidad con la UI actual
             stats["max_prom"] = round(float(self.analizador.ancho_max_promedio), 2)

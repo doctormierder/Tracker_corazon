@@ -92,6 +92,22 @@ class KitEstandar(ProcesadorFrame):
         _, mask_rastreo = cv2.threshold(blur_base, corte, 255, cv2.THRESH_BINARY)
         mask_rastreo = cv2.bitwise_and(mask_rastreo, hex_solido)
 
+        mask_final = np.zeros_like(mask_medicion)
+        contornos, _ = cv2.findContours(mask_medicion, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if contornos:
+            # Nos quedamos solo con el contorno más grande (el corazón)
+            mayor = max(contornos, key=cv2.contourArea)
+            
+            # Creamos el Casco Convexo (el polígono que envuelve todo como una goma elástica)
+            hull = cv2.convexHull(mayor)
+            
+            # Dibujamos ese polígono relleno en la máscara final
+            cv2.drawContours(mask_final, [hull], -1, 255, -1)
+        
+        # Ahora mask_medicion es un polígono convexo sólido, sin "alitas"
+        mask_medicion = mask_final
+
         return mask_rastreo, img_tratada, mask_medicion
 
 class SelectorKits:

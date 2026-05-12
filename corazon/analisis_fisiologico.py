@@ -4,80 +4,9 @@ import math
 import time
 from collections import deque
 
-def calcular_ancho_instante(mask, p1, p2, angulo_deg_ignorado, num_rebanadas=10):
-    """
-    Mide el ancho del tejido utilizando Álgebra Lineal pura y Raycasting.
-    Ignoramos el ángulo externo para evitar desfasajes trigonométricos.
-    """
-    if mask is None or np.sum(mask) == 0:
-        return 0, None
-    
-    h, w = mask.shape
-    dx = p2[0] - p1[0]
-    dy = p2[1] - p1[1]
-    largo_eje = math.hypot(dx, dy)
-    
-    if largo_eje == 0:
-        return 0, None
-        
-    # 1. Vector unitario longitudinal y Perpendicular Estricta
-    ux, uy = dx / largo_eje, dy / largo_eje
-    px, py = -uy, ux 
-    
-    # Rango máximo de búsqueda (mitad de la pantalla por seguridad)
-    dist_max = int(math.hypot(w, h) / 2)
-    
-    anchos = []
-    puntos_linea_debug = None
-    
-    # 2. Análisis por rebanadas
-    for i in range(1, num_rebanadas):
-        t = i / num_rebanadas
-        cx = int(p1[0] + dx * t)
-        cy = int(p1[1] + dy * t)
-        
-        # Generar rayo de coordenadas (desde -dist_max hasta +dist_max)
-        r = np.arange(-dist_max, dist_max + 1)
-        x_coords = np.clip(np.round(cx + r * px).astype(int), 0, w - 1)
-        y_coords = np.clip(np.round(cy + r * py).astype(int), 0, h - 1)
-        
-        # Extraer los valores de los píxeles directamente de la matriz (Ultra rápido)
-        perfil = mask[y_coords, x_coords]
-        idx_centro_matematico = dist_max 
-        
-        # Buscar la masa blanca más cercana al centro matemático
-        blancos = np.where(perfil > 0)[0]
-        if len(blancos) == 0:
-            continue # Rebanada vacía (fuera del tejido)
-            
-        idx_ancla = blancos[np.argmin(np.abs(blancos - idx_centro_matematico))]
-        
-        # 3. Caminar hacia la derecha hasta tocar fondo (negro)
-        perfil_der = perfil[idx_ancla:]
-        ceros_der = np.where(perfil_der == 0)[0]
-        d_der = ceros_der[0] if len(ceros_der) > 0 else len(perfil_der) - 1
-        
-        # 4. Caminar hacia la izquierda hasta tocar fondo
-        perfil_izq = perfil[:idx_ancla+1][::-1]
-        ceros_izq = np.where(perfil_izq == 0)[0]
-        d_izq = ceros_izq[0] if len(ceros_izq) > 0 else len(perfil_izq) - 1
-        
-        ancho_rebanada = d_der + d_izq
-        anchos.append(ancho_rebanada)
-        
-        # 5. Guardar Puntos para Debuging (Asegura captura si la del medio falla)
-        if i == num_rebanadas // 2 or puntos_linea_debug is None:
-            r_der = r[idx_ancla + d_der]
-            r_izq = r[idx_ancla - d_izq]
-            pt_der = (int(cx + r_der * px), int(cy + r_der * py))
-            pt_izq = (int(cx + r_izq * px), int(cy + r_izq * py))
-            puntos_linea_debug = (pt_izq, pt_der)
-            
-    # Promedio de anchos limpios
-    return np.mean(anchos) if anchos else 0.0, puntos_linea_debug
-
 class AnalizadorFisiologico:
     def __init__(self):
+        # Buffers de señales fisiológicas
         self.buffer_anchos = deque(maxlen=300)
         self.buffer_tiempos = deque(maxlen=300)
         
@@ -94,20 +23,97 @@ class AnalizadorFisiologico:
         self.puntos_grafico = 200
         self.sweep_y = np.zeros(self.puntos_grafico)
         self.cursor_x = 0
-
-    def procesar_frame(self, mask, p1, p2, angulo):
-        t_actual = time.time()
-        ancho, pts_debug = calcular_ancho_instante(mask, p1, p2, angulo)
         
-        if ancho > 0:
-            self.buffer_anchos.append(ancho)
+        # --- MEMORIA ELÁSTICA DEL ESCÁNER ---
+        # Diccionario: { indice_rebanada : (centro_historico, ancho_historico) }
+        self.memoria_rayos = {} 
+        self.inercia = 0.85 # Fricción (0.0 = salta instantáneo, 0.99 = inamovible)
+
+    def procesar_frame(self, mask, p1, p2, angulo_deg_ignorado, num_rebanadas=10):
+        t_actual = time.time()
+        
+        if mask is None or np.sum(mask) == 0:
+            return 0, None
+            
+        h, w = mask.shape
+        dx = p2[0] - p1[0]
+        dy = p2[1] - p1[1]
+        largo_eje = math.hypot(dx, dy)
+        
+        if largo_eje == 0:
+            return 0, None
+            
+        # 1. Vector Perpendicular Estricto
+        ux, uy = dx / largo_eje, dy / largo_eje
+        px, py = -uy, ux 
+        
+        dist_max = int(math.hypot(w, h) / 2)
+        anchos = []
+        puntos_linea_debug = None
+        
+        # 2. Análisis por rebanadas con MEMORIA ELÁSTICA
+        for i in range(1, num_rebanadas):
+            t = i / num_rebanadas
+            cx = int(p1[0] + dx * t)
+            cy = int(p1[1] + dy * t)
+            
+            # Generar rayo de coordenadas transversales
+            r = np.arange(-dist_max, dist_max + 1)
+            x_coords = np.clip(np.round(cx + r * px).astype(int), 0, w - 1)
+            y_coords = np.clip(np.round(cy + r * py).astype(int), 0, h - 1)
+            
+            perfil = mask[y_coords, x_coords]
+            
+            # Recuperar estado histórico de esta rebanada específica
+            centro_hist, ancho_hist = self.memoria_rayos.get(i, (dist_max, dist_max / 2.0))
+            
+            # 3. VENTANA DE VISIÓN RESTRINGIDA (Evita ruidos lejanos)
+            margen_latido = max(30, ancho_hist * 0.75) 
+            limite_izq = int(max(0, centro_hist - margen_latido))
+            limite_der = int(min(len(perfil) - 1, centro_hist + margen_latido))
+            
+            zona_permitida = np.zeros_like(perfil)
+            zona_permitida[limite_izq:limite_der] = perfil[limite_izq:limite_der]
+            
+            blancos = np.where(zona_permitida > 0)[0]
+            
+            if len(blancos) < 2:
+                continue # Rebanada vacía en esta iteración
+                
+            # 4. IGNORAMOS EL HUECO NEGRO CENTRAL (Sístole)
+            # Tomamos exclusivamente la pared exterior izquierda y derecha
+            idx_izq = blancos[0]
+            idx_der = blancos[-1]
+            
+            ancho_rebanada = float(idx_der - idx_izq)
+            centro_actual = idx_izq + (ancho_rebanada / 2.0)
+            
+            anchos.append(ancho_rebanada)
+            
+            # 5. ACTUALIZAR FRICCIÓN (El escáner es arrastrado suavemente)
+            self.memoria_rayos[i] = (
+                (self.inercia * centro_hist) + ((1.0 - self.inercia) * centro_actual),
+                (self.inercia * ancho_hist) + ((1.0 - self.inercia) * ancho_rebanada)
+            )
+            
+            # Guardar puntos para dibujar en pantalla
+            if i == num_rebanadas // 2 or puntos_linea_debug is None:
+                pt_izq = (int(cx + r[idx_izq] * px), int(cy + r[idx_izq] * py))
+                pt_der = (int(cx + r[idx_der] * px), int(cy + r[idx_der] * py))
+                puntos_linea_debug = (pt_izq, pt_der)
+                
+        # --- PROCESAMIENTO DE SEÑALES ---
+        ancho_final = np.mean(anchos) if anchos else 0.0
+        
+        if ancho_final > 0:
+            self.buffer_anchos.append(ancho_final)
             self.buffer_tiempos.append(t_actual)
-            self.sweep_y[self.cursor_x] = ancho
+            self.sweep_y[self.cursor_x] = ancho_final
             self.cursor_x = (self.cursor_x + 1) % self.puntos_grafico
             self._detectar_eventos()
             self._actualizar_atributos_directos()
             
-        return ancho, pts_debug
+        return ancho_final, puntos_linea_debug
 
     def _detectar_eventos(self):
         if len(self.buffer_anchos) < 10: return
