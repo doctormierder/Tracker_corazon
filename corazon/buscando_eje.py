@@ -117,7 +117,6 @@ def viaje_en_el_tiempo_definitivo(cap):
                 
                 # ... (El resto del código de la intersección y el score sigue igual)
                 interseccion = cv2.bitwise_and(line_mask, mascara_tiempo)
-                interseccion = cv2.bitwise_and(line_mask, mascara_tiempo)
                 pts_blancos = np.where(interseccion > 0)
                 
                 if len(pts_blancos[0]) > 0:

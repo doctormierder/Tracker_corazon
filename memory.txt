@@ -1,0 +1,78 @@
+# Project Memory
+
+## Attempt 1: Binary Mask with Convex Hull [FAILED]
+- **Date**: Early development
+- **Method**: Topographic thresholding (16 strips along heart axis) -> binary mask.
+  Thickness measured as distance between first and last white pixel along each
+  perpendicular slice. Elastic memory (exponential smoothing) for stability.
+- **Why it failed**: Binary mask discards all edge strength information. During
+  systole, heart walls stretch and brighten (approach cavity intensity), causing
+  the mask to incorrectly expand. Result: measured thickness INCREASES during
+  contraction (opposite of physiology). Cells between heart and microscope
+  create false edges that binary thresholding cannot distinguish from real walls.
+- **Key lesson**: Intensity-only binary thresholding is fundamentally insufficient
+  because wall brightness varies with stretch state.
+
+## Attempt 2: Pure Intensity Gradient [FAILED]
+- **Date**: 2026-05-12
+- **Method**: Replaced binary mask with gradient-based edge detection on
+  img_tratada (8-bit grayscale, processed through KitBiologico: CLAHE +
+  bilateral + tophat + sobel + median + close). Found max positive gradient
+  (dark->bright) and max negative gradient (bright->dark) per slice.
+- **Why it failed**: img_tratada lacks sharp enough gradients for reliable edge
+  detection. The heavy processing pipeline smooths edges, and the hex mask
+  multiplication creates artificial gradients at its boundary. Result: no edges
+  detected, static debug line, flat cardiogram signal.
+- **Key lesson**: Processed images are not suitable for direct gradient edge
+  detection; edges are too diffuse.
+
+## Attempt 3: Hybrid (Binary Mask + Gradient Sub-pixel) [FAILED]
+- **Date**: 2026-05-12
+- **Method**: Binary mask for approximate edge positions, then sub-pixel
+  gradient refinement (within +/-5px of each mask edge) using img_tratada
+  intensity profile. Kept Gaussian slice weighting and Savitzky-Golay smoothing.
+- **Why it failed**: The binary mask is the upstream weak link. It already
+  gives wrong positions during systole (mask expands with bright walls). Sub-pixel
+  refinement cannot fix fundamentally wrong initial estimates.
+- **Key lesson**: The measurement method must be independent of binarization.
+  Fixing the measurement alone is useless if the mask is corrupted by systole
+  brightening.
+
+## Current: Multi-cue Temporal Fusion [ACTIVE]
+- **Date**: 2026-05-12
+- **Method**: Combine 3 orthogonal evidence sources per pixel, per slice:
+  1. Temporal stddev (60-frame rolling buffer of intensity profiles per slice)
+     - High where walls oscillate (movement is independent of brightness)
+     - Medium where cells move (they move slower than walls)
+     - Low in static cavity and background
+  2. Motion map (frame-to-frame absolute difference, blurred)
+     - Instantaneous motion evidence (walls moving right now)
+     - No lag, but noisier than temporal
+  3. 4-bit confidence mask (16-level topographic threshold)
+     - Inverted: (15 - level) = "not-cavity" probability
+     - Smooth intensity gradients, preserves edge falloff
+  Plus:
+  - Adaptive weights (trust temporal more as buffer fills)
+  - Per-slice quality score (reject slices with weak wall peaks)
+  - Quality-weighted + Gaussian weighted mean across slices
+  - Savitzky-Golay final smoothing (7-window, 3rd order)
+- **Rationale**:
+  - Temporal stddev solves the systole problem: walls always move, even when
+    they brighten. Their movement creates variance that is independent of
+    absolute intensity.
+  - Cells between heart and microscope move slower than walls -> lower
+    variance amplitude -> distinguishable from real walls.
+  - Motion map bridges the first few frames before temporal buffer fills.
+  - 4-bit mask preserves partial information about edge transitions,
+    reducing jitter compared to binary threshold.
+  - Quality score per slice handles axis misalignment during diastole: if
+    the axis falls outside the thin cavity, only noise is seen on one side,
+    and the slice is rejected.
+- **Key insight from user**: "Noise" is actually cells between heart and
+  microscope. They have consistent structure and move with the heartbeat but
+  slower than the walls. This means variance AMPLITUDE (not just presence)
+  separates them from walls.
+- **Key insight from user**: The symmetry axis can be off-center during diastole
+  (thin cavity). This produces asymmetric slices where one side has walls and
+  the other has only cells. Solution: per-slice quality rejection.
+- **Status**: Active development.

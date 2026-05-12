@@ -61,6 +61,9 @@ class VideoWorker(QObject):
         self._last_blur_val = -1
         self._hex_suave_cache = None
 
+        # Frame anterior para mapa de movimiento
+        self._prev_gray = None
+
     def escalar_pixel(self, valor_base, width_actual):
         """
         Calcula el tamaño en píxeles que debe tener un dibujo (línea, círculo) 
@@ -170,7 +173,6 @@ class VideoWorker(QObject):
 
                 
             # --- BYPASS DE DECODIFICACIÓN MANUAL PARA LINUX ---
-            # --- BYPASS DE DECODIFICACIÓN MANUAL PARA LINUX ---
             if es_mpg_linux:
                 # Si OpenCV nos tiró la toalla y nos dio un 8UC1 (Gris puro)
                 if len(frame.shape) == 2 or frame.shape[2] == 1:
@@ -202,31 +204,41 @@ class VideoWorker(QObject):
             hex_suave = self._hex_suave_cache
 
             # --- 1.2 PROCESAMIENTO PIXEL A PIXEL (Kit Biológico) ---
-            # Asumimos que el procesador devuelve mask y la imagen tratada ecualizada
             resultado_kit = procesador.procesar(frame, self.config, self.hex_solido_maestro, hex_suave)
             if len(resultado_kit) == 3:
                 mask_rastreo, img_tratada, _ = resultado_kit
             else:
                 mask_rastreo, img_tratada = resultado_kit
 
-            # --- 1.3 UMBRALIZACIÓN TOPOGRÁFICA ADAPTATIVA ---
+            # --- MAPA DE MOVIMIENTO (frame differencing) ---
+            gray_curr = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray_curr = cv2.GaussianBlur(gray_curr, (5, 5), 0)
+            if self._prev_gray is not None:
+                motion_map = cv2.absdiff(gray_curr, self._prev_gray)
+                motion_map = cv2.GaussianBlur(motion_map, (5, 5), 0)
+            else:
+                motion_map = np.zeros_like(gray_curr)
+            self._prev_gray = gray_curr.copy()
+
+            # --- 1.3 UMBRALIZACIÓN TOPOGRÁFICA ADAPTATIVA (4-bit mask) ---
             y1_h, y2_h, x1_h, x2_h = self.roi_hex_coords
             roi_tratada = img_tratada[y1_h:y2_h, x1_h:x2_h]
             roi_mask = self.hex_solido_maestro[y1_h:y2_h, x1_h:x2_h]
-            
+
             Y_roi, X_roi = np.indices(roi_tratada.shape)
             X_global = X_roi + x1_h
             Y_global = Y_roi + y1_h
-            
+
             proyeccion_long = (X_global * v_long_x) + (Y_global * v_long_y)
             pixeles_validos = roi_mask > 0
-            
-            mask_medicion = np.zeros_like(img_tratada)
+
+            mask_4bit = np.zeros_like(img_tratada, dtype=np.uint8)
+            mask_binaria = np.zeros_like(img_tratada, dtype=np.uint8)
 
             if np.any(pixeles_validos):
                 proj_validas = proyeccion_long[pixeles_validos]
                 min_p, max_p = np.min(proj_validas), np.max(proj_validas)
-                
+
                 num_franjas = 16
                 rango_franja = (max_p - min_p) / num_franjas
                 mapa_umbrales = np.zeros_like(roi_tratada, dtype=np.float32)
@@ -235,33 +247,48 @@ class VideoWorker(QObject):
                 for i in range(num_franjas):
                     lim_inf = min_p + i * rango_franja
                     lim_sup = lim_inf + rango_franja if i < num_franjas - 1 else max_p + 1
-                    
+
                     mask_franja = pixeles_validos & (proyeccion_long >= lim_inf) & (proyeccion_long < lim_sup)
                     pixeles_franja = roi_tratada[mask_franja]
-                    
+
                     if len(pixeles_franja) > 10:
                         luz_fondo = np.percentile(pixeles_franja, 50)
-                        max_absoluto = np.percentile(pixeles_franja, 98) 
+                        max_absoluto = np.percentile(pixeles_franja, 98)
                     else:
                         luz_fondo, max_absoluto = 127, 255
-                        
+
                     if val_slider >= 50:
                         porcentaje = (val_slider - 50) / 50.0
                         umbral_franja = luz_fondo + ((max_absoluto - luz_fondo) * porcentaje)
                     else:
                         porcentaje = (50 - val_slider) / 49.0
                         umbral_franja = luz_fondo - ((max_absoluto - luz_fondo) * porcentaje)
-                        
+
                     mapa_umbrales[mask_franja] = np.clip(umbral_franja, 0, 255)
 
                 mapa_suave = cv2.GaussianBlur(mapa_umbrales, (19, 19), 0)
-                mask_medicion_roi = (roi_tratada >= mapa_suave).astype(np.uint8) * 255
-                mask_medicion_roi = cv2.bitwise_and(mask_medicion_roi, roi_mask)
-                mask_medicion[y1_h:y2_h, x1_h:x2_h] = mask_medicion_roi
 
-            # --- 1.4 ANÁLISIS FISIOLÓGICO (¡Corregido! Ahora se hace DESPUÉS de llenar mask_medicion) ---
+                # Binary mask (for visualization only)
+                mask_binaria_roi = (roi_tratada >= mapa_suave).astype(np.uint8) * 255
+                mask_binaria_roi = cv2.bitwise_and(mask_binaria_roi, roi_mask)
+                mask_binaria[y1_h:y2_h, x1_h:x2_h] = mask_binaria_roi
+
+                # 4-bit mask: how far above threshold, mapped to 0-15
+                diff = roi_tratada.astype(np.float32) - mapa_suave
+                diff = np.clip(diff, 0, None)
+                diff = diff * (roi_mask > 0).astype(np.float32)
+                if np.any(diff > 0):
+                    p95 = np.percentile(diff[diff > 0], 95)
+                    max_diff = max(p95, 1.0)
+                    mask_4bit_roi = np.clip((diff / max_diff * 15).astype(np.uint8), 0, 15)
+                else:
+                    mask_4bit_roi = np.zeros(roi_tratada.shape, dtype=np.uint8)
+                mask_4bit[y1_h:y2_h, x1_h:x2_h] = mask_4bit_roi
+
+            # --- 1.4 ANÁLISIS FISIOLÓGICO (fusión temporal multi-señal) ---
             ancho_f, pts_debug = self.analizador.procesar_frame(
-                mask_medicion, self.p1_calib, self.p2_calib, self.angulo_base
+                img_tratada, mask_4bit, motion_map,
+                self.p1_calib, self.p2_calib, self.angulo_base
             )
 
             # Dibujo de línea de medición (Debug) usando proporciones de pantalla
@@ -274,8 +301,7 @@ class VideoWorker(QObject):
                 cv2.circle(frame, pts_debug[1], radio_debug, (255, 255, 255), -1)
 
             # --- 1.5 CÁLCULO DE POSICIÓN ÓPTIMA (Puntuación por Línea Gruesa) ---
-            # ¡CAMBIO APLICADO! Ahora usamos mask_medicion (la de la Pantalla 4)
-            contornos, _ = cv2.findContours(mask_medicion, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            contornos, _ = cv2.findContours(mask_binaria, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
             if contornos:
                 mayor = max(contornos, key=cv2.contourArea)
@@ -293,8 +319,7 @@ class VideoWorker(QObject):
                     y1 = max(0, by - pad); y2 = min(h_f_actual, by + bh + pad)
                     x1 = max(0, bx - pad); x2 = min(w_f_actual, bx + bw + pad)
                     
-                    # ¡CAMBIO APLICADO! El recorte también se hace sobre mask_medicion
-                    roi_rastreo = mask_medicion[y1:y2, x1:x2]
+                    roi_rastreo = mask_binaria[y1:y2, x1:x2]
                     grosor_test = self.escalar_pixel(15, w_f_actual) 
 
                     for offset in desplazamientos:
@@ -366,7 +391,7 @@ class VideoWorker(QObject):
 
             qt_f = to_qt_image(frame)
             qt_tr = to_qt_image(img_tratada, is_gray=True)
-            qt_m2 = to_qt_image(mask_medicion, is_gray=True)
+            qt_m2 = to_qt_image(mask_binaria, is_gray=True)
             
             # Generamos el cardiograma de tamaño idéntico a la cámara
             img_cardio = self.analizador.generar_cardiograma(w_f_actual, h_f_actual)
