@@ -329,9 +329,28 @@ class VentanaPrincipal(QMainWindow):
 
     def _detener_trabajador_actual(self):
         if self.worker:
-            self.worker.stop()
+            # 1. DESCONECTAR la señal 'finished' antes de detener el worker
+            # Esto evita que la interrupción manual dispare el Autoplay y devore la cola
+            try:
+                self.worker.finished.disconnect(self._video_terminado)
+            except TypeError:
+                pass # Ignoramos si la señal no estaba conectada
+                
+            # 2. Bajar la bandera de ejecución del worker
+            self.worker._running = False
+            if hasattr(self.worker, 'stop'):
+                self.worker.stop()
+                
+            # 3. Cerrar el hilo de forma ordenada
             self.thread.quit()
             self.thread.wait()
+            
+            # 4. Limpiar la memoria para evitar superposición de máscaras
+            self.worker.deleteLater()
+            self.thread.deleteLater()
+            
+            self.worker = None
+            self.thread = None
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls(): event.acceptProposedAction()
