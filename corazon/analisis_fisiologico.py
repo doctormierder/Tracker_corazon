@@ -80,17 +80,9 @@ class AnalizadorFisiologico:
     def __init__(self):
         self.buffer_anchos = deque(maxlen=300)
         self.buffer_tiempos = deque(maxlen=300)
-        
-        self.picos = []   
-        self.valles = []  
-        self.tiempos_picos = []
-        self.bpms_historial = []
-
-        self.ancho_max_promedio = 0.0
-        self.ancho_min_promedio = 0.0
-        self.bpm_media = 0.0
-        self.variacion_bpm = 0.0
-
+        self.picos = []; self.valles = []; self.tiempos_picos = []; self.bpms_historial = []
+        self.ancho_max_promedio = 0.0; self.ancho_min_promedio = 0.0
+        self.bpm_media = 0.0; self.variacion_bpm = 0.0
         self.puntos_grafico = 200
         self.sweep_y = np.zeros(self.puntos_grafico)
         self.cursor_x = 0
@@ -103,9 +95,11 @@ class AnalizadorFisiologico:
             self.buffer_anchos.append(ancho)
             self.buffer_tiempos.append(t_actual)
             self.sweep_y[self.cursor_x] = ancho
+            self.sweep_y[self.cursor_x] = ancho
             self.cursor_x = (self.cursor_x + 1) % self.puntos_grafico
-            self._detectar_eventos()
-            self._actualizar_atributos_directos()
+            # Placeholder de eventos de frecuencia (no tocar por ahora)
+            # self._detectar_eventos()
+            # self._actualizar_atributos_directos()
             
         return ancho, pts_debug
 
@@ -113,7 +107,6 @@ class AnalizadorFisiologico:
         if len(self.buffer_anchos) < 10: return
         vals = list(self.buffer_anchos)
         
-        # Pico (Sístole / Ancho Máximo)
         if vals[-3] > vals[-5] and vals[-3] > vals[-1] and vals[-3] > np.mean(vals) * 1.02:
             t_ahora = time.time()
             if not self.tiempos_picos or (t_ahora - self.tiempos_picos[-1] > 0.25):
@@ -122,7 +115,6 @@ class AnalizadorFisiologico:
                 if len(self.tiempos_picos) > 1:
                     self.bpms_historial.append(60.0 / (self.tiempos_picos[-1] - self.tiempos_picos[-2]))
         
-        # Valle (Diástole / Ancho Mínimo)
         if vals[-3] < vals[-5] and vals[-3] < vals[-1] and vals[-3] < np.mean(vals) * 0.98:
             self.valles.append(vals[-3])
 

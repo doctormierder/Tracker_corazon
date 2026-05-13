@@ -108,6 +108,19 @@ class KitEstandar(ProcesadorFrame):
         # Ahora mask_medicion es un polígono convexo sólido, sin "alitas"
         mask_medicion = mask_final
 
+        if contornos:
+            # 1. Encontrar la masa principal (el planeta)
+            mayor_contorno = max(contornos, key=cv2.contourArea)
+            
+            # 2. Calcular la envolvente convexa (la banda elástica)
+            hull = cv2.convexHull(mayor_contorno)
+            
+            # 3. Crear una máscara limpia y rellenar solo el polígono convexo
+            mask_limpia = np.zeros_like(mask_medicion)
+            cv2.drawContours(mask_limpia, [hull], -1, 255, -1)
+            
+            mask_medicion = mask_limpia
+
         return mask_rastreo, img_tratada, mask_medicion
 
 class SelectorKits:
