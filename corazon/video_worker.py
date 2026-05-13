@@ -123,7 +123,7 @@ class VideoWorker(QObject):
             
             # Geometría: +40% de largo (1.40), 50% de ancho del largo total
             L_h = largo_pantalla * 1.40 
-            W_h = L_h * 0.50
+            W_h = L_h * 0.40
             
             pts_hex = np.array([
                 [centro_vis_x + v_long_x * (L_h/2), centro_vis_y + v_long_y * (L_h/2)],
@@ -254,7 +254,7 @@ class VideoWorker(QObject):
                         
                     mapa_umbrales[mask_franja] = np.clip(umbral_franja, 0, 255)
 
-                mapa_suave = cv2.GaussianBlur(mapa_umbrales, (19, 19), 0)
+                mapa_suave = cv2.GaussianBlur(mapa_umbrales, (41, 41), 0)
                 mask_medicion_roi = (roi_tratada >= mapa_suave).astype(np.uint8) * 255
                 mask_medicion_roi = cv2.bitwise_and(mask_medicion_roi, roi_mask)
                 mask_medicion[y1_h:y2_h, x1_h:x2_h] = mask_medicion_roi
